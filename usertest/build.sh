@@ -13,6 +13,7 @@
 #   ICD=/path/to.dylib ./build.sh   # 用别处的 ICD 库；ICD=none 不带它（vk_test 会 dlopen 失败，内核 API 部分照常）
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$HERE"
 . "$HERE/../env.sh"
 ROOT="$MALIMETAL_ROOT"
 DEVICE="${DEVICE_DIR:?set DEVICE_DIR (the UniXNU-evb10 checkout) in .env}"
