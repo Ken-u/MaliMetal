@@ -1,0 +1,44 @@
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -1341,6 +1341,41 @@
+    VkExternalMemoryHandleTypeFlagBits handleType,
+    VkExternalMemoryProperties *external_properties)
+ {
++#ifdef __APPLE__
++   /* VK_EXT_external_memory_host: a linear 2D image can be bound to the
++    * caller's own pages (the Metal front end's textures over IOSurfaces and
++    * no-copy buffers), so the framebuffer is rendered in place instead of
++    * through a shadow image copied in and out around every pass. Import only,
++    * and only for a linear layout: the pages hold the caller's rows, at the
++    * driver's pitch (VK_IMAGE_TILING_LINEAR) or at the caller's
++    * (DRM_FORMAT_MOD_LINEAR with an explicit plane layout). */
++   if (handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) {
++      const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *mod_info =
++         vk_find_struct_const(
++            pImageFormatInfo->pNext,
++            PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
++      const bool linear_layout =
++         pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR ||
++         (pImageFormatInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
++          mod_info && mod_info->drmFormatModifier == DRM_FORMAT_MOD_LINEAR);
++
++      if (pImageFormatInfo->type != VK_IMAGE_TYPE_2D || !linear_layout) {
++         return panvk_errorf(
++            physical_device, VK_ERROR_FORMAT_NOT_SUPPORTED,
++            "host allocations back only linear 2D images (VkImageTiling(%d))",
++            pImageFormatInfo->tiling);
++      }
++
++      *external_properties = (VkExternalMemoryProperties){
++         .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
++         .exportFromImportedHandleTypes = 0,
++         .compatibleHandleTypes =
++            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++      };
++      return VK_SUCCESS;
++   }
++#endif
++
+    const VkExternalMemoryHandleTypeFlags supported_handle_types =
+       VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+       VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;

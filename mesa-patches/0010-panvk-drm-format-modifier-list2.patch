@@ -1,0 +1,46 @@
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -1031,6 +1031,43 @@
+       }
+    }
+ 
++   /* The same list with the 64-bit features (VK_KHR_format_feature_flags2),
++    * which a client that has them asks for: the 32-bit list cannot carry the
++    * storage bits above bit 31, and one left unfilled reads as a modifier
++    * with no features at all. */
++   VkDrmFormatModifierPropertiesList2EXT *list2 = vk_find_struct(
++      pFormatProperties->pNext, DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT);
++   if (list2) {
++      VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierProperties2EXT, out,
++                             list2->pDrmFormatModifierProperties,
++                             &list2->drmFormatModifierCount);
++      if (tex && PANVK_DEBUG(WSI_AFBC)) {
++         PAN_SUPPORTED_MODIFIERS(supported);
++         for (int mi = 0; mi < ARRAY_SIZE(supported); mi++) {
++            if (drm_is_afbc(supported[mi]) &&
++                pan_afbc_supports_format(arch, vk_format_to_pipe_format(format)))
++            {
++               vk_outarray_append_typed(VkDrmFormatModifierProperties2EXT, &out, mod_props)
++               {
++                  mod_props->drmFormatModifier = supported[mi];
++                  mod_props->drmFormatModifierPlaneCount = 1;
++                  mod_props->drmFormatModifierTilingFeatures = tex;
++               }
++            }
++         }
++      }
++
++      if (tex) {
++         vk_outarray_append_typed(VkDrmFormatModifierProperties2EXT, &out,
++                                  mod_props)
++         {
++            mod_props->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
++            mod_props->drmFormatModifierPlaneCount = 1;
++            mod_props->drmFormatModifierTilingFeatures = tex;
++         }
++      }
++   }
++
+    VkSubpassResolvePerformanceQueryEXT *subpass_resolve_perf = vk_find_struct(
+       pFormatProperties->pNext, SUBPASS_RESOLVE_PERFORMANCE_QUERY_EXT);
+    if (subpass_resolve_perf) {
