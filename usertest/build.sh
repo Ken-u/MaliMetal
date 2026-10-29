@@ -2,7 +2,7 @@
 # 在构建机上跑。把 gpu_test.c + vk_test.c 编成 arm64-apple-ios17.0 的可执行文件（lld 的 ad hoc 签名，CodeDirectory 页大小 4 KiB，和 4K 内核对得上），
 # 连同 PanVK 的 ICD 库（libvulkan_panfrost.dylib，mesa-build/build-mesa-ios.sh 的产物）一起：
 #   1. 读出它们的 cdhash（cdhash.py）；
-#   2. 生成 drivers/Mali/gpu_files.inc（内核带着这些文件，boot-arg evb10-exec=1 时写进 Data 卷的 /private/var/evb10，
+#   2. 生成 package/Mali/gpu_files.inc（内核带着这些文件，boot-arg evb10-exec=1 时写进 Data 卷的 /private/var/evb10，
 #      第一个当 init 跑；大的以 zlib 流携带，内核里 uncompress 开）；
 #   3. 做 owner trust bundle（uefi-evb10 的 tools/xnu-probe/make-owner-trust-bundle.py：owner 模块带这些 cdhash + 原版两个模块一字节不改）；
 #   4. 把 bundle 的 SHA-256 写进 board.toml 的 [payload] trust_cache_sha256（只换第二项，原版那一项不动）。

@@ -2,7 +2,7 @@
  * libdrm stand-in for Darwin / iOS: PanVK talks to the Mali-G610 through it.
  *
  * PanVK issues Panthor ioctls (drmIoctl on a DRM fd), uses DRM syncobjs through libdrm (drmSyncobj*) and mmap()s buffer objects through the DRM
- * fd. None of that exists here. What exists is the IOKit service MaliService (drivers/Mali), whose user client takes Panthor's uAPI
+ * fd. None of that exists here. What exists is the IOKit service MaliService (package/Mali), whose user client takes Panthor's uAPI
  * apart into calls that carry no user pointers (mali_uapi.h). This file is the other half:
  *
  *   - the "DRM fd" is a descriptor of /dev/null; every fd is served by ONE IOKit connection per process (PanVK keeps several fds, which are

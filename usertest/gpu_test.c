@@ -1,5 +1,5 @@
 /*
- * The first user task that talks to the Mali-G610 driver (Mali, drivers/Mali): everything the kernel-side self-test of
+ * The first user task that talks to the Mali-G610 driver (Mali, package/Mali): everything the kernel-side self-test of
  * M3b does through externalMethod() from kernel_task, here through IOKit from a real process, with memory mapped by
  * IOConnectMapMemory64 into this task. It stands for what the libdrm stand-in (darwin-drm/drm_darwin.c) will do for PanVK.
  *
