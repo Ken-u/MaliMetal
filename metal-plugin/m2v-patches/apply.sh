@@ -3,7 +3,8 @@
 # scripts/build-adreno-metal-bridge.py 的顺序一致）+ 本板子的一处改动（池块上限 8 MiB，见下）。
 #   用法：./apply.sh [目录]   默认 $M2V（先 git clone --shared 原树再 checkout 720ef1ce）
 set -euo pipefail
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/env.sh"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$HERE/../../env.sh"
 DIR="${1:-${M2V:?set M2V in .env or pass the directory}}"
 UP="${UP:-${UNIXNU:?set UNIXNU in .env}/drivers/AdrenoMetal}"
 REV="${REV:-d6ca655}"           # AdrenoMetal 的提交（上游分支 feat/ipados27-gpu-parity，2026-10-29）
@@ -29,7 +30,7 @@ open(p, 'w').write(s.replace(old, new, 1))
 PYEOF
 # 本板子的补丁（本目录下 0100- 起的文件，按文件名顺序）：
 #   0100  YCbCr 双平面纹理：平面字节没变就不再转换（ycbcr_memo.rs；M2V_YCBCR_MEMO=N 才生效，N=每次采样的 64 字节块数）
-for f in "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"/0*.patch; do
+for f in "$HERE"/0*.patch; do
 	[ -f "$f" ] || continue
 	git apply "$f" || { echo "error: $f 打不上" >&2; exit 1; }
 done
