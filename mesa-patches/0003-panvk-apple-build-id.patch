@@ -1,0 +1,15 @@
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -247,7 +247,12 @@
+    }
+ 
+    unsigned build_id_len = build_id_length(note);
++#ifdef __APPLE__
++   /* A Mach-O LC_UUID is 16 bytes; copy_build_id_to_sha1() pads it to a SHA-1. */
++   if (build_id_len < 16) {
++#else
+    if (build_id_len < BUILD_ID_EXPECTED_HASH_LENGTH) {
++#endif
+       return panvk_errorf(NULL, VK_ERROR_INITIALIZATION_FAILED,
+                           "build-id too short.  It needs to be a SHA");
+    }

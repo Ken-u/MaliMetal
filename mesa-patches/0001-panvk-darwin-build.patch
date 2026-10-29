@@ -1,0 +1,91 @@
+--- a/meson.build
++++ b/meson.build
+@@ -1821,6 +1821,10 @@
+     required : with_dri2 or with_dri or with_gbm,
+     allow_fallback: allow_fallback_for_libdrm,
+   )
++elif host_machine.system() == 'darwin' and with_panfrost_vk
++  # Darwin: PanVK talks Panthor ioctls and DRM syncobjs, which we serve from a userspace libdrm shim
++  # (darwin-drm) in front of the Mali IOKit user client. Found through the cross file's pkg-config.
++  dep_libdrm = dependency('libdrm', required : true)
+ else
+   # We should prevent libdrm from being available when the target doesn't have it to avoid transitive
+   # dependencies (such as vk-runtime) linking to it
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -73,7 +73,12 @@
+    drmVersionPtr version;
+    int fd;
+ 
++#ifdef __APPLE__
++   /* No device node on Darwin: the libdrm shim hands out an fd bound to the Mali IOKit user client. */
++   fd = drm_darwin_open_render();
++#else
+    fd = open(path, O_RDWR | O_CLOEXEC);
++#endif
+    if (fd < 0) {
+       return panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+                           "failed to open device %s", path);
+@@ -119,6 +124,14 @@
+                    const struct panvk_instance *instance,
+                    drmDevicePtr drm_device)
+ {
++#ifdef __APPLE__
++   /* The shim's "render node" is not a file, there is no st_rdev to report. */
++   device->drm.render_rdev = 0;
++   device->drm.primary_rdev = 0;
++   (void)drm_device;
++   (void)instance;
++   return VK_SUCCESS;
++#else
+    struct stat st;
+ 
+    if (stat(drm_device->nodes[DRM_NODE_RENDER], &st)) {
+@@ -138,6 +151,7 @@
+    }
+ 
+    return VK_SUCCESS;
++#endif
+ }
+ 
+ static void
+--- a/src/vulkan/runtime/vk_image.c
++++ b/src/vulkan/runtime/vk_image.c
+@@ -23,7 +23,7 @@
+ 
+ #include "vk_image.h"
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
+ #include <drm-uapi/drm_fourcc.h>
+ #endif
+ 
+@@ -96,7 +96,7 @@
+       vk_find_struct_const(pCreateInfo->pNext, WSI_IMAGE_CREATE_INFO_MESA);
+    image->wsi_legacy_scanout = wsi_info && wsi_info->scanout;
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
+    image->drm_format_mod = ((1ULL << 56) - 1) /* DRM_FORMAT_MOD_INVALID */;
+ #endif
+ 
+@@ -175,7 +175,7 @@
+    vk_object_free(device, alloc, image);
+ }
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
+ VKAPI_ATTR VkResult VKAPI_CALL
+ vk_common_GetImageDrmFormatModifierPropertiesEXT(UNUSED VkDevice device,
+                                                  VkImage _image,
+--- a/src/vulkan/runtime/vk_image.h
++++ b/src/vulkan/runtime/vk_image.h
+@@ -76,7 +76,7 @@
+    /* wsi_image_create_info::scanout */
+    bool wsi_legacy_scanout;
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
+    /* VK_EXT_drm_format_modifier
+     *
+     * Initialized by vk_image_create/init() to DRM_FORMAT_MOD_INVALID.  It's

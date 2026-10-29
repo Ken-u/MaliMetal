@@ -1,0 +1,26 @@
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -1628,6 +1628,23 @@
+       return;
+    }
+ 
++#ifdef __APPLE__
++   /* VK_EXT_external_memory_host: a buffer can be bound to the caller's own pages (the
++    * Metal front end's newBufferWithBytesNoCopy:). Import only; the handle type has no
++    * export, and it is compatible with nothing but itself. */
++   if (pExternalBufferInfo->handleType ==
++       VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) {
++      pExternalBufferProperties->externalMemoryProperties =
++         (VkExternalMemoryProperties){
++            .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
++            .exportFromImportedHandleTypes = 0,
++            .compatibleHandleTypes =
++               VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++         };
++      return;
++   }
++#endif
++
+    const VkExternalMemoryHandleTypeFlags supported_handle_types =
+       VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+       VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;

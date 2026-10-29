@@ -1,0 +1,23 @@
+--- a/src/util/os_mman.h
++++ b/src/util/os_mman.h
+@@ -51,7 +51,19 @@
+ #endif
+ 
+ 
+-#if DETECT_OS_ANDROID && !defined(__LP64__)
++#if DETECT_OS_APPLE
++/* Darwin: the "DRM fd" of PanVK is served by a libdrm stand-in (darwin-drm) that turns the mmap offset of a buffer object into an
++ * IOConnectMapMemory64 and falls back to mmap() for every other descriptor. */
++extern void *drm_darwin_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
++extern int drm_darwin_munmap(void *addr, size_t length);
++
++#  define os_mmap(addr, length, prot, flags, fd, offset) \
++             drm_darwin_mmap(addr, length, prot, flags, fd, offset)
++
++#  define os_munmap(addr, length) \
++             drm_darwin_munmap(addr, length)
++
++#elif DETECT_OS_ANDROID && !defined(__LP64__)
+ /* 32-bit needs mmap64 for 64-bit offsets */
+ #  define os_mmap(addr, length, prot, flags, fd, offset) \
+              mmap64(addr, length, prot, flags, fd, offset)

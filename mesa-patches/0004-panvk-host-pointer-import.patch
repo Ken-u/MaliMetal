@@ -1,0 +1,168 @@
+--- a/src/panfrost/lib/kmod/pan_kmod.h
++++ b/src/panfrost/lib/kmod/pan_kmod.h
+@@ -631,6 +631,12 @@
+ 
+ struct pan_kmod_bo *pan_kmod_bo_import(struct pan_kmod_dev *dev, int fd);
+ 
++#ifdef __APPLE__
++/* A BO over the caller's own pages (VK_EXT_external_memory_host); ptr and size are whole 4 KiB pages. */
++struct pan_kmod_bo *pan_kmod_bo_import_host(struct pan_kmod_dev *dev, void *ptr,
++                                            size_t size);
++#endif
++
+ static inline int
+ pan_kmod_bo_export(struct pan_kmod_bo *bo)
+ {
+--- a/src/panfrost/lib/kmod/pan_kmod.c
++++ b/src/panfrost/lib/kmod/pan_kmod.c
+@@ -189,6 +189,40 @@
+    return NULL;
+ }
+ 
++#ifdef __APPLE__
++struct pan_kmod_bo *
++pan_kmod_bo_import_host(struct pan_kmod_dev *dev, void *ptr, size_t size)
++{
++   struct pan_kmod_bo *bo = NULL;
++   struct pan_kmod_bo **slot;
++
++   simple_mtx_lock(&dev->handle_to_bo.lock);
++
++   uint32_t handle;
++   if (drm_darwin_bo_create_host(dev->fd, ptr, size, &handle))
++      goto err_unlock;
++
++   slot = util_sparse_array_get(&dev->handle_to_bo.array, handle);
++   if (!slot || *slot)
++      goto err_close_handle;
++
++   bo = dev->ops->bo_import(dev, handle, size);
++   if (!bo)
++      goto err_close_handle;
++
++   *slot = bo;
++   simple_mtx_unlock(&dev->handle_to_bo.lock);
++   return bo;
++
++err_close_handle:
++   drmCloseBufferHandle(dev->fd, handle);
++
++err_unlock:
++   simple_mtx_unlock(&dev->handle_to_bo.lock);
++   return NULL;
++}
++#endif
++
+ void
+ pan_kmod_flush_bo_map_syncs_locked(struct pan_kmod_dev *dev)
+ {
+--- a/src/panfrost/vulkan/panvk_device_memory.c
++++ b/src/panfrost/vulkan/panvk_device_memory.c
+@@ -98,6 +98,33 @@
+    if (fd_info && !fd_info->handleType)
+       fd_info = NULL;
+ 
++#ifdef __APPLE__
++   /* VK_EXT_external_memory_host: a BO over the caller's own pages. */
++   const VkImportMemoryHostPointerInfoEXT *host_info =
++      vk_find_struct_const(pAllocateInfo->pNext,
++                           IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
++
++   if (host_info && !host_info->handleType)
++      host_info = NULL;
++
++   if (host_info) {
++      if (host_info->handleType !=
++             VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
++          (((uintptr_t)host_info->pHostPointer | pAllocateInfo->allocationSize) &
++           4095)) {
++         result = panvk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++         goto err_destroy_mem;
++      }
++
++      mem->bo = pan_kmod_bo_import_host(device->kmod.dev,
++                                        (void *)host_info->pHostPointer,
++                                        pAllocateInfo->allocationSize);
++      if (!mem->bo) {
++         result = panvk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++         goto err_destroy_mem;
++      }
++   } else
++#endif
+    if (fd_info) {
+       assert(
+          fd_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
+@@ -443,6 +470,35 @@
+    return VK_SUCCESS;
+ }
+ 
++#ifdef __APPLE__
++VKAPI_ATTR VkResult VKAPI_CALL
++panvk_GetMemoryHostPointerPropertiesEXT(
++   VkDevice _device, VkExternalMemoryHandleTypeFlagBits handleType,
++   const void *pHostPointer,
++   VkMemoryHostPointerPropertiesEXT *pMemoryHostPointerProperties)
++{
++   VK_FROM_HANDLE(panvk_device, device, _device);
++   const struct panvk_physical_device *phys_dev =
++      to_panvk_physical_device(device->vk.physical);
++
++   if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
++       ((uintptr_t)pHostPointer & 4095))
++      return panvk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++
++   /* The imported pages keep the owner's CPU mapping; the importer cleans and
++    * invalidates its own caches around the GPU's use (as an IOSurface's owner
++    * does), so they are offered as the host-visible coherent types. */
++   pMemoryHostPointerProperties->memoryTypeBits = 0;
++   for (uint32_t i = 0; i < phys_dev->memory.type_count; i++) {
++      const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++      if ((phys_dev->memory.types[i].propertyFlags & want) == want)
++         pMemoryHostPointerProperties->memoryTypeBits |= 1u << i;
++   }
++   return VK_SUCCESS;
++}
++#endif
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ panvk_GetMemoryFdPropertiesKHR(VkDevice _device,
+                                VkExternalMemoryHandleTypeFlagBits handleType,
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -149,6 +149,9 @@
+       .EXT_extended_dynamic_state2 = true,
+       .EXT_external_memory_acquire_unmodified = true,
+       .EXT_external_memory_dma_buf = true,
++#ifdef __APPLE__
++      .EXT_external_memory_host = true,
++#endif
+       .EXT_global_priority = true,
+       .EXT_global_priority_query = true,
+       .EXT_graphics_pipeline_library = true,
+@@ -829,6 +832,8 @@
+       .viewportSubPixelBits = 0,
+       /* Align on a page. */
+       .minMemoryMapAlignment = os_page_size,
++      /* VK_EXT_external_memory_host: whole 4 KiB pages. */
++      .minImportedHostPointerAlignment = 4096,
+       /* Some compressed texture formats require 128-byte alignment. */
+       .minTexelBufferOffsetAlignment = 64,
+       /* Always aligned on a uniform slot (vec4). */
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -354,3 +354,14 @@
+ {
+    return panvk_GetInstanceProcAddr(instance, pName);
+ }
++
++#ifdef __APPLE__
++/* There is no Khronos loader on iOS: a consumer that opens a Vulkan library by path (the metal2vulkan runtime behind the native Metal
++ * device) opens this one and looks up the loader's entry point. PanVK is the only driver there, so the loader's entry is its own. */
++PUBLIC
++VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
++vkGetInstanceProcAddr(VkInstance instance, const char *pName)
++{
++   return panvk_GetInstanceProcAddr(instance, pName);
++}
++#endif

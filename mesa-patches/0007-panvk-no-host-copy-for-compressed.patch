@@ -1,0 +1,16 @@
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -819,7 +819,12 @@
+    if (fmt.bind & PAN_BIND_DEPTH_STENCIL)
+       features |= VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
+ 
+-   if (features != 0)
++   /* Block-compressed formats stay off the host copy path: on the Mali-G610 the
++    * CPU store into an ASTC 6x6 image's smaller mip levels (7x7 texels, 2x2
++    * blocks) ran past the end of the memory mapping (SIGSEGV in memmove,
++    * AegirPoster's atlas, gpu38); they are copied by a command like any other
++    * image that has no host transfer feature. */
++   if (features != 0 && !util_format_is_compressed(pfmt))
+       features |= VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT;
+ 
+    return features;

@@ -1,0 +1,9 @@
+prefix=@PREFIX@
+includedir=${prefix}/include
+libdir=@LIBDIR@
+
+Name: libdrm
+Description: Darwin libdrm shim for PanVK (Panthor uAPI over IOKit)
+Version: 2.4.123
+Cflags: -I${includedir}
+Libs: -L${libdir} -ldrm_darwin -framework IOKit -framework CoreFoundation

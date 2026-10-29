@@ -1,0 +1,82 @@
+--- a/src/panfrost/vulkan/panvk_cmd_draw.h	2026-10-29 13:30:44.347165054 +0800
++++ b/src/panfrost/vulkan/panvk_cmd_draw.h
+@@ -444,6 +444,30 @@
+    return catt_written_mask;
+ }
+ 
++/* The color attachments a draw writes: those its fragment shader writes, less the
++ * ones its blend state masks off (colorWriteMask 0, or color writes disabled).
++ * A masked-off attachment written by the shader is claimed in the draw's render
++ * target mask (DCD flags 1, 2) and so counts as written to the hardware's tile
++ * tracking though its blend descriptor is OFF: a tile the draw fully covers then
++ * left that attachment's tile buffer as it was before the draw, which for a
++ * preload that skips such tiles is unloaded memory (zero): the tile stores out black. */
++static inline uint32_t
++color_attachment_effective_written_mask(
++   const struct panvk_shader_variant *fs,
++   const struct vk_dynamic_graphics_state *dyns)
++{
++   uint32_t mask = color_attachment_written_mask(fs, &dyns->cal);
++   const struct vk_color_blend_state *cb = &dyns->cb;
++
++   for (uint32_t i = 0; i < MAX_RTS && i < cb->attachment_count; i++) {
++      if (!(cb->color_write_enables & BITFIELD_BIT(i)) ||
++          !cb->attachments[i].write_mask)
++         mask &= ~BITFIELD_BIT(i);
++   }
++
++   return mask;
++}
++
+ static inline uint32_t
+ color_attachment_read_mask(const struct panvk_shader_variant *fs,
+                            const struct vk_input_attachment_location_state *ial,
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c	2026-10-29 13:30:44.347165054 +0800
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -1913,7 +1913,10 @@
+    bool dcd2_dirty =
+       fs_user_dirty(cmdbuf) ||
+       dyn_gfx_state_dirty(cmdbuf, INPUT_ATTACHMENT_MAP) ||
+-      dyn_gfx_state_dirty(cmdbuf, COLOR_ATTACHMENT_MAP);
++      dyn_gfx_state_dirty(cmdbuf, COLOR_ATTACHMENT_MAP) ||
++      /* the written mask leaves out the masked-off attachments */
++      dyn_gfx_state_dirty(cmdbuf, CB_WRITE_MASKS) ||
++      dyn_gfx_state_dirty(cmdbuf, CB_COLOR_WRITE_ENABLES);
+ #if PAN_ARCH >= 13
+    dcd2_dirty |= dyn_gfx_state_dirty(cmdbuf, MS_ALPHA_TO_COVERAGE_ENABLE) ||
+                  dyn_gfx_state_dirty(cmdbuf, DS_DEPTH_TEST_ENABLE) ||
+@@ -1953,6 +1956,8 @@
+       fs_user_dirty(cmdbuf) || gfx_state_dirty(cmdbuf, RENDER_STATE) ||
+       gfx_state_dirty(cmdbuf, OQ) || dcd2_dirty;
+    bool dcd1_dirty = dyn_gfx_state_dirty(cmdbuf, MS_RASTERIZATION_SAMPLES) ||
++                     dyn_gfx_state_dirty(cmdbuf, CB_WRITE_MASKS) ||
++                     dyn_gfx_state_dirty(cmdbuf, CB_COLOR_WRITE_ENABLES) ||
+                      dyn_gfx_state_dirty(cmdbuf, MS_SAMPLE_MASK) ||
+                      /* line mode needs primitive topology */
+                      dyn_gfx_state_dirty(cmdbuf, RS_LINE_MODE) ||
+@@ -1977,7 +1982,7 @@
+    uint8_t rt_written = 0, rt_read = 0;
+ 
+    if (fs) {
+-      rt_written = color_attachment_written_mask(fs, &dyns->cal);
++      rt_written = color_attachment_effective_written_mask(fs, dyns);
+       rt_read = color_attachment_read_mask(fs, &dyns->ial, rt_mask);
+       shader_modifies_coverage = fs->info.fs.writes_coverage ||
+                                  fs->info.fs.can_discard || alpha_to_coverage;
+--- a/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c	2026-10-29 13:30:44.351165117 +0800
++++ b/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c
+@@ -771,6 +771,14 @@
+ always_load(const struct pan_fb_load *load,
+             const struct panvk_frame_shader_key *key)
+ {
++   /* PANVK_PRELOAD_ALWAYS=1 (diagnostics): preload every tile of the render area, not
++    * only the tiles a primitive intersects. */
++   static int force = -1;
++   if (force < 0)
++      force = getenv("PANVK_PRELOAD_ALWAYS") != NULL;
++   if (force)
++      return true;
++
+    for (unsigned rt = 0; rt < PAN_MAX_RTS; rt++) {
+       if (pan_fb_shader_key_target_written(&key->key.rts[rt]) &&
+           load->rts[rt].always)

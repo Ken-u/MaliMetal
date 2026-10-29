@@ -1,0 +1,10 @@
+# Machine-specific paths and secrets
+.env
+# Build outputs
+out/
+build/
+*.o
+*.a
+*.dylib
+*.bundle/
+__pycache__/
