@@ -1,0 +1,31 @@
+diff --git a/crates/metal2vulkan/src/bind/plan/slots.rs b/crates/metal2vulkan/src/bind/plan/slots.rs
+--- a/crates/metal2vulkan/src/bind/plan/slots.rs
++++ b/crates/metal2vulkan/src/bind/plan/slots.rs
+@@ -312,6 +312,13 @@
+         .collect()
+ }
+ 
++/// Whether `M2V_YCBCR_FILTER=device` asks for the device's own linear filter of a converted YCbCr texture's shadow image
++/// ([`ycbcr_variant`]); read once.
++fn device_ycbcr_filter() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("M2V_YCBCR_FILTER").is_ok_and(|v| v == "device"))
++}
++
+ /// The texture slots whose linear samples the function emulates on a device that samples
+ /// through Metal's own sampler where the slot is bound in a YCbCr format
+ /// (`RuntimeFact::YCbCrTexture`) at which `shape` binds a texture of a two-plane YCbCr format
+@@ -322,6 +329,13 @@
+     dependencies: &[RuntimeDependency],
+     shape: &BindShape,
+ ) -> std::collections::BTreeSet<SlotRef> {
++    // `M2V_YCBCR_FILTER=device` (EVB10: Mali-G610, the shadow image of a converted texture is an ordinary R16G16B16A16_SFLOAT image):
++    // no slot is in the YCbCr variant, so a linear sample of a converted texture is the device's own filter of the shadow's texels like
++    // every other texture's on a device that samples natively, not Metal's filter emulated exactly in the fragment function (about 570
++    // instructions a sample: 16 of the 22 ms of a full-screen pass over a 3416 x 3416 wallpaper at 750 MHz).
++    if device_ycbcr_filter() {
++        return std::collections::BTreeSet::new();
++    }
+     dependencies
+         .iter()
+         .filter_map(|d| match d.fact {
