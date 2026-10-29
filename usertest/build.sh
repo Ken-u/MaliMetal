@@ -34,9 +34,14 @@ unset CCC_OVERRIDE_OPTIONS LLVM_CONFIG CLANG_BIN CC CXX
 "$GLSLANG" -V -x -o "$HERE/vk_shader.inc" "$HERE/shaders/square.comp" > /dev/null
 "$GLSLANG" -V -x -o "$HERE/vk_tri_vert.inc" "$HERE/shaders/tri.vert" > /dev/null
 "$GLSLANG" -V -x -o "$HERE/vk_tri_frag.inc" "$HERE/shaders/tri.frag" > /dev/null
+# vk_bench.c: a full-screen fill into one or two targets, with a constant, an arithmetic-heavy and a blended fragment shader
+"$GLSLANG" -V -x -o "$HERE/vk_bench_vert.inc" "$HERE/shaders/bench.vert" > /dev/null
+for s in bench1 bench2 benchh1 benchh2 benchb; do
+	"$GLSLANG" -V -x -o "$HERE/vk_$s.inc" "$HERE/shaders/$s.frag" > /dev/null
+done
 
 "$A/clang-20" -target arm64-apple-ios17.0 -isysroot "$SDK" -O2 -Wall -Wextra -Werror -I"$DRIVER" -I"$MESA/src/mesa/include" -I"$HERE" \
-	-fuse-ld=lld -B"$A" -Wl,-adhoc_codesign gpu_test.c vk_test.c vk_gfx.c -framework IOKit -framework CoreFoundation -o "$OUT/gpu-test" 2> >(grep -v "directory not found" >&2) \
+	-fuse-ld=lld -B"$A" -Wl,-adhoc_codesign gpu_test.c vk_test.c vk_gfx.c vk_bench.c cpu_bench.c -framework IOKit -framework CoreFoundation -o "$OUT/gpu-test" 2> >(grep -v "directory not found" >&2) \
 	|| { echo "error: 编译失败" >&2; exit 1; }
 "$PY" "$HERE/cdhash.py" "$OUT/gpu-test"
 

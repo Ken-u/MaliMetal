@@ -446,6 +446,9 @@ int vk_test(void)
    }
    int gfx = vk_gfx(gdpa, dev, queue, family, &mem);
    say("vk-test: graphics: %s", gfx ? "FAILED" : "OK (clear + triangle through the tiler and the fragment job)");
+   if (!gfx)
+      vk_bench(gdpa, dev, queue, family, &mem);   /* timings only: what a pass and a full-screen fill cost; a failure there does not fail the test */
+   cpu_bench();   /* timings only: each core's speed and where new threads land */
    destroy_device(dev, NULL);
    if (gfx)
       return 1;
