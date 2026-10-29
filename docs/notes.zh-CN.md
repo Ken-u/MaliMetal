@@ -173,14 +173,16 @@ Metal → 插件 → PanVK，**每个进程一个独立的 Mali 连接**：
 
 ## 滚动一帧要 100 ms：壁纸的 YCbCr 每个编码器都重新转换（2026-10-29，`板子运行 perf1…`perf8`）
 
-**症状**：滚动（主屏翻页）时真实帧率 8–10 fps，`mali: user: status: K…` 的 `ctc`（提交到回调）100–380 ms；GPU 时钟 198 与 594 MHz 帧时间一样，所以不是着色器算力。
+**症状**：滚动（主屏翻页）时真实帧率 8–10 fps，`mali: user: status: K…` 的 `ctc`（提交到回调）100–380 ms；当时看到 GPU 时钟 198 与 594 MHz 帧时间一样，据此认为不是着色器算力。
+**这条推断后来被推翻**（见下面「帧率」一节）：那是在 73–77 ms 的转换 dispatch 还占着一帧的时候量的；去掉转换之后，重通道的耗时严格随 GPU 时钟走（198 / 594 / 750 MHz：84.9 / 28.4 / 22.5 ms）。
 
 **新增的量法**（都在插件里，只对 backboardd 生效，除非另说）：
 
 | 东西 | 用法 / 含义 |
 | --- | --- |
 | K 行 `gpu=…us st=…us` | 一个命令缓冲的 GPU 耗时（两个时间戳：桥给每个批次开头结尾写的）和提交后多久才开始。`gpu=0us st=-1us` = 在途命令缓冲太多，没分到时间戳槽 |
-| `mali-panvk-debug=…` | 设 `PANVK_DEBUG`（`force_blackhole`：整个片段着色都不做，用来看一帧是不是片段瓶颈） |
+| `mali-panvk-debug=…` | 设 `PANVK_DEBUG`（`noafbc`、`linear` 改图像布局，`startup` 打印旗标）。**不要用 `force_blackhole`**：它只是把稀疏缓冲/图像映射到一页「黑洞」内存，**并不跳过片段着色**（2026-10-30 的 `tr3` 白跑一轮，读了 Mesa 源码才确认） |
+| `mali-skip-format=N` / `mali-skip-pipeline=P/P…` | 跳过所有绑了 N 号像素格式纹理的绘制（500 = 壁纸的两平面 YCbCr）/ 跳过管线标签（最后一个点之后的部分，如 `PBGRAXm_A2Xhf`）匹配的所有绘制（模式里的 `.` 代表任意文本，`.Tds4.` = 标签里含 Tds4 的）；`mali-list-pipelines=1` 把每个不同的标签打印一次。用来量「去掉这一类绘制，GPU 时间还剩多少」 |
 | `mali-trace=print` | Mesa 的 u_trace（`MESA_GPU_TRACES`）：每个命令缓冲、渲染通道（尺寸、格式、tile 大小）、屏障、cache flush、同步等待都带 GPU 自己的时间戳；插件里的 `traceWrite`（funopen）在内存里汇总成 `gt …` 行（`gt R WxH rtN FORMAT tileN DURus` 是通道，另有 `gt dispatch`、`gt meta`、`gt cb`…），再用脚本按形状汇总 |
 
 **`mali-trace` 只能当诊断用**：u_trace 的克隆堆（`PANVK_UTRACE_CLONE_MEM_SIZE`，插件设成 32 MiB）在 backboardd 活了约 100–115 s 后用光，Mesa 在 NULL 上解引用，backboardd 段错误。
@@ -210,6 +212,108 @@ backboardd 的沙箱会杀掉在 `pipe()` 和「给 fd 2 建文件 / dup2」上�
 | K 行里 GPU ≥ 60 ms 的 | 8 个（最大 96 ms） | **0 个**（最大 54 ms） |
 | `gt dispatch` ≥ 5 ms（`perf8`，开 trace） | 约 100 个 73–77 ms（`perf6`） | **1 个** |
 
-**还剩**：`perf8` 里 1072×1904 的 rt2 通道有 **96 个固定 28–30 ms**（同形状的普通通道 1–3 ms），一帧约 40–50 ms 的 GPU 里有一个。这是那张 93 MB 的 F16 壁纸被缩小 3.2 倍采样的全屏通道：
-时钟不敏感，所以多半是内存/MMU 的事（客户端缓冲一直是 4 KiB 页映射，93 MB = 23 K 页，采样跨度大时 GPU 的 TLB 整个吃不下）。下一节试了 2 MiB 块映射：**没有改善**。
+**还剩（当时的判断，已被推翻）**：`perf8` 里 1072×1904 的 rt2 通道有 **96 个固定 28–30 ms**（同形状的普通通道 1–3 ms），一帧约 40–50 ms 的 GPU 里有一个。这是那张 93 MB 的 F16 壁纸被缩小 3.2 倍采样的全屏通道。
+当时以为「时钟不敏感，所以多半是内存/MMU 的事」，试了 2 MiB 块映射：没有改善（Mali 仓库的笔记里有）。**真正的原因是 m2v 在片元着色器里逐位仿 Metal 的 YCbCr 线性滤波（约 570 条指令一次采样），是算力，不是内存**——见下一节。
+
+## 帧率：滑动稳态 38 → 50 fps，最好的手势 58 fps（2026-10-30，`板子运行 clk750、ycf*、ycx*、shd*、vb4/vb5、fp1–fp3、ord1/ord2、cp1–cp3、fv1/fv2`）
+
+标记：**[板上]** = 在板子上观察到的；**[主机]** = 只在主机上验证的（构建、补丁打得上、脚本）。
+
+**指标**：`evb10-touch-demo` 的手势（先上滑解锁，然后左右交替各滑 0.8 s，每 7 s 一次）。**手指按下的 0.8 s 里面板实际显示的帧数**（`frame_phases.py TAG`），取第 3–11 个手势
+（第 0–2 个手势是解锁和启动期，帧数波动很大，不计）。同时看「相邻帧间隔 > 25 ms 的个数」和「命令缓冲 GPU 时间的中位数」。命令缓冲的时间线要开 `mali-timeline=1`。
+
+| 运行 | 与上一行的区别 | 平均 fps | 间隔 > 25 ms | 中位 CB 的 GPU 时间 |
+| --- | --- | --- | --- | --- |
+| `tl1` | 基线：GPU 750 MHz、`mali-ycbcr-filter=device`、PanVK 旧的 FPK 规则 | 37.9 | 89 | 14.1 ms |
+| `fp1` | 同 `tl1`（重复一次，看运行间波动） | 40.0 | 80 | 14.1 ms |
+| `fp3` | FPK 原型（`mali-panvk-fpk=always`：只挡目标读；已不在补丁里） | 44.7 | 51 | 9.6 ms |
+| `cp1` | FPK 终版（Mesa 0011，默认） | 43.2 | 63 | 9.7 ms |
+| `cp2` | A76 优先的核编号（见 3.2） | 47.5 | 37 | 9.7 ms |
+| `cp3` | 再加 `cpumask=0x1f`（只开 5 个核：4 个 A76 + 引导核） | 50.3 | 19 | 9.7 ms |
+
+同配置的两次（`tl1`、`fp1`）差 2.1 fps：**单个平均值的误差约 ±2 fps**，`cp1→cp3` 里「间隔 > 25 ms 的个数」（63 → 37 → 19）比平均值更可信。最好的一个手势：`cp2` 58.8、`cp3` 57.5 fps。
+起点（`perf1`，修 YCbCr 转换之前）是约 100 ms 一帧、8–10 fps；`perf7` 之后平均交给显示的间隔 26–56 ms。
+**上面全是用 `EXTRA_KERNEL_ARGS` 加的参数量的**（`evb10-vop-direct=1 evb10-vop-fence=1 mali-pll=1 mali-div=1 mali-ycbcr-filter=device`）；`board.toml` 的默认参数没有改，
+**不带这些参数时跑的仍是拷贝式扫描、GPU 198 MHz**。复现：
+
+```
+cd uefi-evb10 && ARGS="evb10-touch-demo=120 evb10-vop-direct=1 mali-pll=1 mali-div=1 evb10-vop-fence=1 evb10-bt=x evb10-bt2=x evb10-bt3=x evb10-bt4=x mali-ycbcr-filter=device mali-timeline=1"
+(FV=$PWD/out/fv.bin CAPTURE_SECS=235 EXTRA_KERNEL_ARGS="$ARGS" setsid nohup tools/xnu-probe/run-kernel.sh TAG > runs/TAG.driver.log 2>&1 </dev/null &)
+/usr/bin/python3 tools/xnu-probe/frame_phases.py TAG      # 每个手势一行，末尾两行是汇总
+```
+
+### 1. GPU 这一边
+
+**1.1 时钟（`mali-pll=1 mali-div=1`，Mali 仓库 `aa7028f`）[板上]**：`mali-pll=N` 选 `clk_gpu_src` 的源（0 GPLL 1188 MHz，1 CPLL，2 AUPLL，3 NPLL），`mali-div` 是分频（默认 5 → 198 MHz；1 → GPLL/2 = 594 MHz；
+CPLL/2 = 750 MHz）。电压是 UEFI 设的 0.75 V，没有动；厂商的工作点表里 800 MHz 对最差的片子也是 0.75 V，所以 750 MHz 不需要升压——但**这不是调频**，只是把固定频率抬高。
+同一个 1072×1904 的重通道：198 MHz 84.9 ms，594 MHz 28.4 ms，750 MHz 22.5 ms（周期计数器探针读到 750 MHz）。**重通道的时间严格跟时钟走**；`perf` 一节里「198 与 594 MHz 帧时间一样」的说法是在转换 dispatch 占着一帧时量的，不能外推。
+
+**1.2 壁纸通道是 YCbCr 滤波的算力（m2v 补丁 0101，`mali-ycbcr-filter=device`）[板上]**：Metal 对两平面 YCbCr 纹理的线性采样，m2v 在片元着色器里**逐位仿**（`bind/plan/slots.rs`），`mali-bifrost-debug=shaderdb`（`gpu_shaderdb.py`）数出来
+**约 570 条指令一次采样**。壁纸（`J120.HEIC`，3416×3416）的全屏通道在 750 MHz 要 22.5 ms；`device` = 用设备自己的线性滤波器去采转换后的影子图，**7.9 ms**。代价：不再和 Metal 逐位一致。**静态锁屏截图比较**（`fx1` = exact、`fv1` = device，其余参数相同；RGB565，4:1 平均）：127568 个点里 1483 个不同（1.2 %，壁纸区域 1159 个），
+最大差 9/255（RGB565 的一级是 8），平均差 0.07——和截图自己的量化噪声同量级；同一张主屏小组件页（第 9 张）也是这样。默认不变（`exact`）。
+被反驳的假设：纹理带宽（把影子图存成 8 位的实验没有改变帧时间，补丁已删）、页表遍历（2 MiB 块映射）。
+
+**1.3 通道和填充的底噪（`vk_bench.c`，`usertest`）[板上]**：750 MHz 下 1072×1904 BGRA8——一个没有绘制的通道 0.136 ms；常量色全屏填充每次 0.026 ms（79 Gpx/s），带混合的每次 0.237 ms（8.6 Gpx/s），
+很重的 ALU 着色器每次 0.133 ms（15 Gpx/s）。**混合/重着色器的全屏层才是贵的**；常量色的层几乎白送。这也是 FPK 值钱的原因：被后面的不透明全屏层盖住的层，不杀就得白画。
+
+**1.4 前向像素杀（FPK）：旧规则几乎让 CA 的 pass 用不上它（Mesa 0011）[板上]**：CA 的 pass 都绑着一个无内存的第二颜色附件（写掩码 0 / 不写）。PanVK 旧规则：`allow_forward_pixel_to_kill` 要求**所有绑定的颜色附件都被写**，
+于是这些 pass 里的绘制全都不允许杀别人，叠着画的全屏层全部照跑。G610 的实际判据（`vk_bench.c` 的杀伤矩阵，两个目标，受害绘制是重着色器，杀手是 4 次常量填充；「杀」= 通道变便宜）：**后画的写集合 ⊇ 先画的写集合才杀**，部分写掩码按「读目标」算：
+
+| 受害者的写集合 \ 杀手的写集合 | {0} | {1} | {0,1} |
+| --- | --- | --- | --- |
+| {0} | 杀 | 不杀 | 杀 |
+| {1} | 不杀 | 杀 | 杀 |
+| {0,1} | 不杀 | 不杀 | 杀 |
+
+（旧规则只有最后一列杀。）Mesa 0011：去掉「所有绑定附件都被写」这一条，保留「着色器能 FPK、没有 alpha-to-coverage、没有目标读/混合、没有读后写」几条；`PANVK_FPK=bound`（`mali-panvk-fpk=bound`）恢复旧规则做 A/B。
+**正确性证据**：杀伤矩阵 9 对里，**只有受害者写的那些目标上，2041088 个像素 0 个不同**（`ord2`；不杀的那些对子也一样）；`fv1`（新规则）与 `fv2`（`bound`）的**静态**锁屏截图逐像素相同（`evb10-shot-img` 第 6 张，4:1 采样 127568 个像素 0 个不同；
+第 5 张只有顶部时钟/日期带里差 ≤ 9）。同配置的两次不同运行里，静态锁屏截图本身也逐点相同（`shot1` 第 3 张 = `fv1` 第 6 张，0 个不同），所以这个比较的噪声底是 0。**动画中的帧无法逐像素比较**：截图是在串口上一行一行读活的帧缓冲，要几秒，运动的内容会撕开（白块边缘呈锯齿、时钟数字呈横纹，新旧规则的截图里都有），这不是渲染错误。
+效果：命令缓冲 GPU 时间中位数 14.1 → 9.7 ms；平均 +4～6 fps（`fp3`、`cp1` 对 `tl1`、`fp1` 的平均 39）。**这是改变默认渲染行为的补丁，是否作为默认由人决定**（工作区里已是默认）。
+
+### 2. 帧节奏（从时间线推出来的模型，不是直接量到的）[板上]
+
+- 渲染服务器在上一个 vsync 之后约 **14 ms** 提交命令缓冲（编码 + 提交）；帧在 GPU 做完之后的**第一个 vsync** 显示。要赶上 V+2，提交到完成要 **≲ 19.3 ms**（两个 vsync 去掉那 14 ms 的偏移后剩下的）。
+- swap 在命令缓冲「已调度」时交给显示，**在途深度约 2**：一次超时哪怕只有不到 1 ms，也会让相邻几帧一起晚一个 vsync，平均帧率掉约三分之一。
+- 重的命令缓冲（16–17 个通道、93–95 个绘制，GPU 11–13 ms；在 A76 上重放 5.5–6.7 ms + 提交 1.8–2.9 ms）正好压在这条线上；轻的（10 个通道、64–81 个绘制）约 15 ms，稳稳赶上。每个手势的头几帧是重的。
+
+### 3. CPU 这一边
+
+**3.1 提交到 GPU 开始之前的时间都在渲染服务器的编码线程里 [板上]**：时间线字段 `rep.sub.sch.ca.cb`（`mali-timeline=1`）：`rep` = 提交（commit）之后编码线程多久才开始处理它并把编码器的调用**重放**一遍，`sub` = 运行时录制 + 提交花多久，
+`ca`/`cb` = 开始/结束时线程所在的核。提交结束到 GPU 第一个时间戳只有约 **0.7 ms**（p99 1.3 ms，最大 1.6 ms，GPU 空闲时 662 个里没有一个 > 2 ms），**没有门铃丢失之类的延迟**。
+所以 `commit → GPU 开始` 的 6 ms 基本是 `rep + sub`。
+
+**3.2 它落在了 A55 上 [板上]**：XNU 按 ADT `/cpus` 子节点的顺序给核编号，调度器偏爱编号最小的空闲核；RK3588 的 A55（物理 0x000–0x300）排在前面，所有重放都在 A55 上（`cp1`：100 %）。`cpu_bench.c`（`usertest`，核号读 `TPIDR_EL0[11:0]`，前后各读一次，中途换核的不算）：
+
+| | ALU（ns/次） | L2 内指针追逐 | 分支混合（128 KiB） | 复制 GB/s | 16 MiB 追逐 | 16 MiB 混合 |
+| --- | --- | --- | --- | --- | --- | --- |
+| A76（逻辑核 0–3，~1775 MHz） | 2.38 | 4.7 | 11.1–11.5 | 3.6–4.3 | 103–108 | **30.6** |
+| A55（逻辑核 4–7，~1861 MHz） | 2.69 | 4.5 | 15.5 | 2.6–2.7 | 94–96 | **96.0** |
+
+**不规则、访存多的代码 A76 快 3.1 倍**（编码线程恰好是这种）。`cp1`：重放中位 6.8 ms、提交 3.0 ms；`cp2`（A76 优先）：重放 4.2 ms（A55 上 11.4、A76 上 3.8）、提交 1.4 ms；
+提交到完成（`ctc`）中位 19.2 → 15.5 ms，p90 29.1 → 24.0 ms（只统计 GPU > 2 ms 的命令缓冲）。开机也快了：`bundle loaded in backboardd` 从 92–95 s 到 71–76 s。
+
+修法（三处，**缺一不可**，`UniXNU-rk3588-common`）：
+1. `dts/rk3588.dtsi`：`cpus` 里 A76（cpu4–7，0x400–0x700）排在前面，A55 在后面。**这一条改变默认的核编号**（工作区里已是）。
+2. `patches/xnu/rk3588-boot-cpu-mpidr.patch`：UniXNU 的主机工具（`scripts/unixnu/devicetree.py`）把**第一个**启用的 cpu 节点标成 `state = running`，XNU 的 `ml_is_boot_cpu()` 就拿它当引导核；
+   固件实际在 A55 0x000 上启动，两者不一致（逻辑 4 → PSCI -4 `ALREADY_ON`，只起来 7 个核）。补丁让 XNU 按 `MPIDR_EL1` 的亲和性找 `reg` 相同的节点（节点列了引导核时），否则回到原来的判据。
+3. `scripts/data/ArmCpu-rk3588-boot-cpu-slot.patch`（构建时对 `drivers/ArmCpu` 子模块打）：引导核不是逻辑 0 时，槽位 0 也是要起的从核（`drainPending` 的循环从 0 开始）。
+
+**3.3 `cpumask=0x1f`（标准 XNU 启动参数）[板上]**：只启用逻辑 0–4（4 个 A76 + 引导的那个 A55）。`cp3`：50.3 fps、间隔 > 25 ms 的 19 个；重放落在 A55 上的比例 23 % → 8 %，提交到完成 p90 24.0 → 20.8 ms。
+代价是关掉 3 个 A55（吞吐少了）；**只当 A/B 用，不是默认**。更好的办法是让高 QoS 线程避开 A55 又不关核（调度策略，没做）。
+
+### 4. 还剩什么（都没做）
+
+- **流式提交**：现在整个命令缓冲编码完、重放完才提交，GPU 在 `rep+sub`（约 6 ms）里空等。让 GPU 在重放的同时就开始跑前面的通道，能把重帧的 `commit → 完成` 压回 19.3 ms 以内。m2v 的 `command_buffer/submit.rs` 已有「Metal 的提交批次」的概念，要读懂再动。
+- **重放本身**：A76 上每个绘制约 40–75 µs，偏高；还没有采样器（用户态 `thread_get_state` 采样编码线程的 PC，再用 `nm` 对插件符号，是最便宜的办法）。
+- 去掉那个死的 memoryless 附件 c1（CA 每个 pass 都带着，没人读）；GPU/CPU 调频（需要 PMIC/电压支持）；GPU 完成中断（现在轮询）。
+- `mali: STALL group …`（有作业 ≥ 2 s 没完成）在 48 份旧日志里有 19 份出现，包括 FPK 之前的；环的 extract 落后 insert 一个作业（`cs req 0x511 ack 0x11`：空闲位没应答，像是固件以为队列已空）。时间线里每个命令缓冲提交后 0.7 ms 内都开始了，所以它多半出在空闲后的第一个作业上；原因未查。
+
+### 5. 新工具、启动参数和坑
+
+- 分析脚本（`uefi-evb10/tools/xnu-probe/`）：`frame_timeline.py TAG`（命令缓冲和面板帧放到同一条时间轴）、`frame_phases.py TAG…`（每个手势的 fps / 间隔 / GPU 忙 / 中位 CB）、`gpu_passes.py`（`mali-trace=print` 的通道）、`gpu_cbcmp.py`（按通道数分组的 GPU 时间对比）、`gpu_shaderdb.py`（`mali-bifrost-debug=shaderdb`）。
+- 启动参数：`mali-timeline=1`、`mali-panvk-fpk=bound`、`mali-ycbcr-filter=device`、`mali-bifrost-debug=shaderdb|statsfull`、`mali-cache=NAME`（换一个空的着色器缓存目录，强制重新编译）、`mali-skip-format=N`、`mali-skip-pipeline=P/P`、`mali-list-pipelines=1`、`mali-pll`/`mali-div`、`cpumask=0x1f`。
+  `usertest` 的 `gpu-test` 末尾现在会跑 `vk_bench` 和 `cpu_bench`（只报告，不影响通过与否）。
+- **同一时刻只能有一个 `run-kernel.sh`**：它们共用板子宿主机上的串口和 `/tmp/probe-payload-boot.img`；启动前 `pgrep -af run-kernel` 必须为空，也别在 Shell 里用 `sleep` 循环等它（会被转后台，然后下一条命令就误启动第二个）。
+- 改了 XNU 补丁列表会重建 `.cache/xnu-work`，`prepare-xnu-source.py` 要从 GitHub 重新下 DriverKit 头文件；`env -i` 会丢掉代理环境，构建内核要把 `https_proxy`/`http_proxy` 传进去（`tmp/chain-k.sh`）。
+- `evb10-shot-img` 截图不是瞬间快照（见 1.4）：动画中的帧会撕开，比较要用静态帧。
 

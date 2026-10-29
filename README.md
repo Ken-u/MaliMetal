@@ -42,8 +42,13 @@ Inputs that are not in this repository: the Mesa tree (`MESA_SRC_ORIG`), the iPh
 ## Status
 
 This is a development snapshot. Verified on the EVB10 board (iPadOS 17.7.11): the lock screen is
-composited on the GPU, about 20 to 24 frames per second while scrolling. 60 fps is not reached; the
-GPU clock is fixed at 594 MHz. Measurements and the open items are in `docs/notes.zh-CN.md`.
+composited on the GPU. While scrolling the home screen the panel gets about 50 frames per second in
+the steady state (the best swipe reaches 58) with the boot-arguments of the frame-rate runs
+(`docs/notes.zh-CN.md`, "帧率": zero-copy scanout with the GPU fence, the GPU at 750 MHz, the device's
+YCbCr filter, the A76 cores numbered first); without them the board still scrolls at the older, much
+lower rate. 60 fps is not reached: the heavy frames at the start of a swipe miss their deadline by
+a few milliseconds, most of it the render server's encoding thread. The GPU and CPU clocks are fixed.
+Measurements and the open items are in `docs/notes.zh-CN.md`.
 
 ## License
 
