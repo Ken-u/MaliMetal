@@ -330,12 +330,40 @@ __attribute__((constructor)) void bundleLoaded() {
     NSSetUncaughtExceptionHandler(&uncaughtException);
 }
 
+// What the runtime told through its message sink: every distinct message (digits masked in the key), its text the first time it is heard, in
+// 150-character rows (a shadow image's reason names the object and why no image aliases it; a degraded pass says what it costs), and its count
+// again each time it has doubled. The telemetry's rows keep only the last warning.
+void printMessageKinds() {
+    enum { kinds = 96 };
+    static uint64_t told[kinds];
+    char text[900];
+    for (size_t i = 0; i < kinds; ++i) {
+        uint64_t count = 0;
+        size_t n = native_bridge_metal_message_kind(i, &count, text, sizeof text);
+        if (!n)
+            break;
+        if (count == told[i])
+            continue;
+        if (!told[i]) {
+            if (n >= sizeof text)
+                n = sizeof text - 1;
+            for (size_t at = 0; at < n; at += 150)
+                mlog("msg %zu: %.150s", i, text + at);
+        } else if (count < told[i] * 2) {
+            continue;
+        }
+        mlog("msg %zu: x%llu", i, (unsigned long long)count);
+        told[i] = count;
+    }
+}
+
 // Every ten seconds, one or two lines on the kernel's console: what the render server asked of the device (native_bridge_metal_status: commits
 // made/failed, completed, pipelines, problems, render passes, draws, full-screen passes, ...) and how the Vulkan pipelines went. It is the
 // proof, from the board, that QuartzCore's frames run on the Mali.
 void *statusThread(void *) {
     for (;;) {
         sleep(10);
+        printMessageKinds();
         char status[512] = {};
         native_bridge_metal_status(status, sizeof status);
         mlog("status: %.180s", status);
@@ -367,6 +395,30 @@ void *statusThread(void *) {
             mlog("status: vkpipe n=%llu failed=%llu total=%llums max=%llums, messages info %llu warning %llu, cache hit %llu miss %llu",
                  (unsigned long long)work[0], (unsigned long long)work[4], (unsigned long long)(work[1] / 1000), (unsigned long long)(work[2] / 1000),
                  (unsigned long long)work[5], (unsigned long long)work[6], (unsigned long long)work[7], (unsigned long long)work[8]);
+        // Where textures over buffers and surfaces cost copies (totals since start; the difference of two lines is the interval): linear images at
+        // Metal's row pitch made / refused / refused again, textures given a shadow image, the shadow copies planned, the texels copied back, passes
+        // over linear images in place / through copies of them.
+        uint64_t tc[8] = {};
+        if (native_bridge_metal_texture_counts(tc))
+            mlog("status: L lin %llu/%llu/%llu sh %llu cp %llu bk %llu pass %llu/%llu", (unsigned long long)tc[0], (unsigned long long)tc[1],
+                 (unsigned long long)tc[2], (unsigned long long)tc[3], (unsigned long long)tc[4], (unsigned long long)tc[5], (unsigned long long)tc[6],
+                 (unsigned long long)tc[7]);
+    }
+    return nullptr;
+}
+
+// mali-timeline=1: every two seconds, a "tl sync" line (the uptime clock in microseconds at that moment: the host stamps the line when it arrives, which
+// ties the two clocks together) and then one "tl" line per up to five command buffers completed since: "t age start gpu ctc rp.dr.kpx rep.sub.sch.ca.cb" each (see
+// native_bridge_metal_timeline), times in units of 100 us (t: the commit's time on the uptime clock). The kernel's "display gaps" lines carry the frames' times on the same clock, so the command buffers
+// of a hitch can be told from the frames the panel got.
+void *timelineThread(void *) {
+    uint64_t cursor = 0;
+    for (;;) {
+        usleep(2000000);
+        mlog("tl sync %llu", (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000));
+        char text[240];
+        while (native_bridge_metal_timeline(&cursor, text, sizeof text))
+            mlog("tl %s", text);
     }
     return nullptr;
 }
@@ -568,10 +620,31 @@ void startDumpFromBootArgs() {
                 *c = ':';   // PASS:FIRST:LAST: the draws of every command buffer's render pass PASS left out
         setenv("NATIVE_METAL_SKIP_DRAWS", value, 1);
     }
-    // mali-panvk-debug=force_blackhole,noafbc,...: PANVK_DEBUG for the render server's driver (comma list; force_blackhole skips all fragment
-    // shading, so a frame that takes as long with it is not fragment-bound; noafbc / linear change the images' layout; startup prints the flags).
+    // mali-panvk-debug=noafbc,linear,...: PANVK_DEBUG for the render server's driver (comma list; noafbc / linear change the images' layout, startup
+    // prints the flags). Not force_blackhole: that one maps sparse buffers and images to a black-hole page, it does not skip any shading.
     if (bootArgValue("mali-panvk-debug", value, sizeof value))
         setenv("PANVK_DEBUG", value, 1);
+    // mali-panvk-fpk=bound: PANVK_FPK=bound, the driver's old rule for forward pixel kill (a draw kills the fragments of earlier draws only if it writes every
+    // bound color attachment; the default lets a draw that leaves one unwritten kill too, CoreAnimation's passes bind a write-masked memoryless second one).
+    // An A/B switch for the frame-rate measurements.
+    if (bootArgValue("mali-panvk-fpk", value, sizeof value))
+        setenv("PANVK_FPK", value, 1);
+    // mali-bifrost-debug=shaderdb or statsfull: BIFROST_MESA_DEBUG for the render server's shader compiler. Every shader the driver compiles prints
+    // its statistics to standard error (the console below): shaderdb one line (instructions, cycles of the arithmetic, load/store, varying and
+    // texture pipes, work registers, threads, spills), statsfull a block with the pipe each shader is bound by.
+    if (bootArgValue("mali-bifrost-debug", value, sizeof value))
+        setenv("BIFROST_MESA_DEBUG", value, 1);
+    // mali-skip-format=N: every draw that has a fragment texture of Metal pixel format N bound (500 is the two-plane YCbCr of the wallpaper) is left
+    // out (NATIVE_METAL_SKIP_FORMAT): the frame's GPU time without what samples such textures, wherever in a pass those draws lie.
+    if (bootArgValue("mali-skip-format", value, sizeof value))
+        setenv("NATIVE_METAL_SKIP_FORMAT", value, 1);
+    // mali-skip-pipeline=PATTERN/PATTERN...: every draw made with a render pipeline whose label (the part after the last dot, e.g. PBGRAXm_A2Xhf, the
+    // plain fills of CoreAnimation) matches a pattern is left out (NATIVE_METAL_SKIP_PIPELINE; a dot in a pattern stands for any text: ".Tds4." is every
+    // label with Tds4 in it): the frame's GPU time without that kind of draw. mali-list-pipelines=1 prints each distinct label as it is made.
+    if (bootArgValue("mali-skip-pipeline", value, sizeof value))
+        setenv("NATIVE_METAL_SKIP_PIPELINE", value, 1);
+    if (bootArgValue("mali-list-pipelines", value, sizeof value))
+        setenv("NATIVE_METAL_LIST_PIPELINES", "1", 1);
     // mali-trace=print: Mesa's u_trace (MESA_GPU_TRACES) in the render server's driver: a line at the start and the end of every command buffer,
     // render pass (size, formats, tile size), barrier, cache flush and sync wait, each with the GPU's own timestamps. It prints to stdout, which
     // gets the same console stream as standard error below.
@@ -587,7 +660,8 @@ void startDumpFromBootArgs() {
             mlog("gpu trace: MESA_GPU_TRACES=%s, the driver's trace lines are summed up here as 'gt' lines", getenv("MESA_GPU_TRACES"));
         }
     }
-    if (trace && !bootArgValue("mali-dump", value, sizeof value)) {
+    // (the shader compiler's statistics, mali-bifrost-debug, go to standard error as well: the console stream is not only for the trace)
+    if ((trace || bootArgValue("mali-bifrost-debug", value, sizeof value)) && !bootArgValue("mali-dump", value, sizeof value)) {
         FILE *console = funopen(nullptr, nullptr, consoleWrite, nullptr, nullptr);
         if (console) {
             setvbuf(console, nullptr, _IOLBF, 0);
@@ -1368,15 +1442,31 @@ id openDevice(unsigned port) {
                 strlcpy(memo, "4096", sizeof memo);
             setenv("M2V_YCBCR_MEMO", memo, 0);
         }
+        {
+            // mali-ycbcr-filter=device: a linear sample of a converted two-plane YCbCr texture (the wallpaper) is the device's own filter of the
+            // converted image's texels, as every other texture's is, and not Metal's filter emulated exactly in the fragment function (about 570
+            // instructions a sample: on the board at 750 MHz the wallpaper's full-screen pass took 22.5 ms with the emulation, 7.9 ms without).
+            // Unset (or =exact): the emulation (m2v-patches/0101, bind/plan/slots.rs).
+            char filter[16];
+            if (bootArgValue("mali-ycbcr-filter", filter, sizeof filter))
+                setenv("M2V_YCBCR_FILTER", filter, 0);
+        }
         if (server)
             startDumpFromBootArgs();
+        // mali-cache=NAME: the shader cache is the directory "m2v-NAME" (keep the name short) instead of "m2v": an empty one, so every pipeline is compiled
+        // again. The shader compiler's statistics (mali-bifrost-debug=shaderdb) are printed for a pipeline that is compiled, not for one the cache has.
+        char leaf[24] = "m2v";
+        if (char name[16]; bootArgValue("mali-cache", name, sizeof name)) {
+            strlcat(leaf, "-", sizeof leaf);
+            strlcat(leaf, name, sizeof leaf);
+        }
         static const unsigned order[] = {4, 0, 1, 2, 3};
         for (unsigned i : order) {
             if (device)
                 break;
             if (!candidates[i][0])
                 continue;
-            strlcat(candidates[i], "m2v", sizeof candidates[i]);
+            strlcat(candidates[i], leaf, sizeof candidates[i]);
             mkdir(candidates[i], 0700);
             if (access(candidates[i], W_OK) != 0) {
                 mlog("metal: cache directory %d (%s) is not writable", i, candidates[i]);
@@ -1428,6 +1518,10 @@ id openDevice(unsigned port) {
                 if (pthread_create(&thread, nullptr, cpuThread, nullptr) == 0)
                     pthread_detach(thread);
                 if (pthread_create(&thread, nullptr, profileThread, nullptr) == 0)
+                    pthread_detach(thread);
+            }
+            if (bootArgHas("mali-timeline=1")) {
+                if (pthread_create(&thread, nullptr, timelineThread, nullptr) == 0)
                     pthread_detach(thread);
             }
         }

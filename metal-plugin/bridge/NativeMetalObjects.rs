@@ -243,8 +243,43 @@ fn log_message(message: &DebugMessage) {
     eprintln!("native-metal message {} {:?}: [{}] {}", seen.len(), message.severity, message.id_name, message.text);
 }
 
+// Every distinct message the sink hears (its id and text with the digits masked, the first KIND_TEXT characters), how many came, and the
+// first one's full text: the plugin's `msg` rows print them from here (`nmb_message_kind`). The runtime's announcements name the object and
+// why (a shadow image's reason, a degraded pass), which nothing else carries to the console: the file of `note_shadow` and the last warning
+// kept only a sample, and a file the process could not read back told nothing.
+const KIND_LIMIT: usize = 96;
+const KIND_TEXT: usize = 400;
+static KINDS: std::sync::Mutex<Vec<(String, u64, String)>> = std::sync::Mutex::new(Vec::new());
+
+fn note_kind(message: &DebugMessage) {
+    let text = format!("[{}] {}", message.id_name, message.text);
+    let key: String = text.chars().take(KIND_TEXT).map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
+    let Ok(mut kinds) = KINDS.lock() else { return };
+    if let Some(kind) = kinds.iter_mut().find(|kind| kind.0 == key) {
+        kind.1 += 1;
+    } else if kinds.len() < KIND_LIMIT {
+        kinds.push((key, 1, text));
+    }
+}
+
+/// The `index`th kind of message the sink heard: its first text (with its id) copied to `out` as a C string, how many came in `*count`;
+/// returns the text's length, 0 past the last kind.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_message_kind(index: usize, count: *mut u64, out: *mut c_char, size: usize) -> usize {
+    guard(0, || {
+        let Ok(kinds) = KINDS.lock() else { return Ok(0) };
+        let Some((_, n, text)) = kinds.get(index) else { return Ok(0) };
+        if !count.is_null() {
+            // SAFETY: the caller's word.
+            unsafe { *count = *n };
+        }
+        Ok(copy_out(text, out, size))
+    })
+}
+
 fn observe_message(message: &DebugMessage) {
     use std::sync::atomic::Ordering::Relaxed;
+    note_kind(message);
     if message.id_name == "shadowed-texture" {
         note_shadow(&message.text);
     }

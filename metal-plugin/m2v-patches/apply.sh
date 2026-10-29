@@ -30,6 +30,8 @@ open(p, 'w').write(s.replace(old, new, 1))
 PYEOF
 # 本板子的补丁（本目录下 0100- 起的文件，按文件名顺序）：
 #   0100  YCbCr 双平面纹理：平面字节没变就不再转换（ycbcr_memo.rs；M2V_YCBCR_MEMO=N 才生效，N=每次采样的 64 字节块数）
+#   0101  YCbCr 双平面纹理的线性采样：M2V_YCBCR_FILTER=device 时用设备自己的滤波器采转换后的影子图，不再在片元着色器里逐位仿 Metal 的滤波
+#         （bind/plan/slots.rs；一次采样约 570 条指令，板上 750 MHz 时整屏壁纸一遍从 22.5 ms 降到 7.9 ms；默认不变）
 for f in "$HERE"/0*.patch; do
 	[ -f "$f" ] || continue
 	git apply "$f" || { echo "error: $f 打不上" >&2; exit 1; }

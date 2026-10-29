@@ -34,6 +34,7 @@
 #include <mach/mach.h>
 #include <thread>
 #include <fcntl.h>
+#include <fnmatch.h>
 #include <unistd.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -179,6 +180,13 @@ static std::atomic<uint64_t> gSurfaceFlushBytes,gSurfaceFlushDuplicates;
 struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;};
 struct CommitRecord {uint64_t committedUs=0,callbackUs=0,ageUs=0,gpuUs=0;int64_t scheduledUs=-1,gpuStartUs=-1;uint32_t index=0;EncodedWork work={};};
 static CommitRecord gCommitRing[32];
+// mali-timeline=1: one short record per completed command buffer, in a ring that the plugin's timeline thread prints (native_bridge_metal_timeline), so the
+// frames of a swipe can be laid out in time: when each was committed, how long it was encoded, when and for how long the GPU ran it, when its callback came.
+struct TimelineRecord {uint64_t committedUs;uint32_t ageUs,gpuUs,callbackUs;int32_t startUs;uint16_t passes,draws;uint32_t kpx;
+                      uint32_t replayUs,submitUs;int32_t scheduledUs;int8_t cpuAtReplay,cpuAtSubmit;};
+static constexpr size_t kTimeline=8192;
+static TimelineRecord gTimeline[kTimeline];
+static uint64_t gTimelineCount;   // records ever written; guarded by gCommitLock
 // Where the time between two render commits goes, by how long that interval was: [0] under 11 ms, [1] to 16.7, [2] to 33, [3] to 200 ms
 // (longer ones are idle). pg = the earlier render buffer's commit-to-callback, enc = this buffer's creation-to-commit, res = what is left
 // (negative when the two overlapped), kpx = the earlier one's thousands of pixels, hv = how many earlier ones were over 30 Mpx.
@@ -199,6 +207,15 @@ static uint32_t threadCpuUs() {
  return (uint32_t)((uint64_t)(info.user_time.seconds+info.system_time.seconds)*1000000ull+(uint64_t)(info.user_time.microseconds+info.system_time.microseconds));
 }
 static uint32_t threadIdLow() {uint64_t id=0;pthread_threadid_np(NULL,&id);return (uint32_t)id;}
+// The core the calling thread runs on right now: arm64 XNU (iOS 17) keeps the number in the low 12 bits of TPIDR_EL0 (what <os/tsd.h>'s
+// _os_cpu_number() reads; the logical cluster is in the 8 bits above). -1 where this is not arm64.
+static int8_t cpuNumberNow() {
+#if defined(__aarch64__)
+ uint64_t p;__asm__ volatile("mrs %0, TPIDR_EL0":"=r"(p));return (int8_t)(p&0xfff);
+#else
+ return -1;
+#endif
+}
 static void tracePush(const TraceRec &rec) {
  const uint32_t at=gTraceHead.fetch_add(1);
  gTrace[at%16384]=rec;
@@ -1442,6 +1459,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
 @interface NBRenderPipeline : NBObject
 @property(nonatomic) NmbRenderPipeline *handle;
 @property(nonatomic,copy) NSString *dumpInfo;   // NATIVE_METAL_DUMP_CB: its functions, formats and vertex layout
+@property(nonatomic) BOOL skipDraws;            // NATIVE_METAL_SKIP_PIPELINE: its label matches, the draws made with it are left out
 @end
 @implementation NBRenderPipeline
 - (void)dealloc {nmb_render_pipeline_release(_handle);}
@@ -1451,6 +1469,36 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
  return s[0];
 }
 @end
+// NATIVE_METAL_SKIP_PIPELINE=PATTERN[/PATTERN...]: the draws made with a render pipeline whose label matches one of the patterns are left out (the
+// frame's GPU time without that kind of draw, wherever in a pass it lies). A pattern is matched, as a whole, against the label's last part, after
+// its final dot (CoreAnimation's plain fills are "PBGRAXm_A2Xhf"); a dot in the pattern stands for any text, so ".Tds4." is every label with Tds4
+// in it and "PBGRABsovXm_." every one that starts with PBGRABsovXm_ (the boot-args cannot hold a star; a slash separates the patterns).
+// NATIVE_METAL_LIST_PIPELINES=1 prints every distinct label as its pipeline is made, and which of them are left out.
+static BOOL skipPipelineLabel(NSString *label) {
+ static const std::vector<std::string> patterns=[]{
+  std::vector<std::string> out;
+  for(const char *p=getenv("NATIVE_METAL_SKIP_PIPELINE");p && *p;) {
+   const char *end=strchr(p,'/');std::string one(p,end?size_t(end-p):strlen(p));
+   for(char &c:one)if(c=='.')c='*';
+   if(!one.empty())out.push_back(one);
+   p=end?end+1:p+strlen(p);
+  }
+  return out;
+ }();
+ static const bool list=getenv("NATIVE_METAL_LIST_PIPELINES")!=nullptr;
+ static std::mutex seenLock;static std::unordered_set<std::string> seen;
+ if(patterns.empty() && !list)return NO;
+ const char *text=label.length?label.UTF8String:"";
+ const char *dot=strrchr(text,'.');const char *tail=dot?dot+1:text;
+ BOOL skip=NO;
+ if(*tail)for(const std::string &p:patterns)if(fnmatch(p.c_str(),tail,0)==0){skip=YES;break;}
+ if(list) {
+  std::lock_guard<std::mutex> guard(seenLock);
+  // (standard error is the console stream while mali-trace or mali-bifrost-debug is on; the shader compiler's statistics of this pipeline come just before)
+  if(seen.size()<600 && seen.insert(tail).second)fprintf(stderr,"native-metal: pipeline %s%s\n",tail,skip?" (draws left out)":"");
+ }
+ return skip;
+}
 @interface NBSampler : NBObject
 @property(nonatomic) NmbSampler *handle;
 @property(nonatomic) NmbSamplerDescriptor descriptor;   // what made it, for a binding that replaces its LOD clamps
@@ -1605,6 +1653,8 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
  uint64_t createdUs;
  uint32_t createCpu,createTid,commitCpu,commitTid;
+ uint64_t submitBeginUs,submitEndUs;   // the encoding thread's half of the commit (-submit): when it began and when the runtime had the commit
+ int8_t submitCpuBegin,submitCpuEnd;   // and the core that thread was on at each (-1: not reached)
  BOOL earlyEligible;   // made by the render server's thread: its completed handlers may run at submission (see fireEarly)
  std::vector<WatchedSource> watched;
 }
@@ -1634,7 +1684,11 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 @property(nonatomic,strong) NSMutableArray<NSString *> *dumpLog;   // its passes and first draws, as encoded (NBEncoder dumpDraw:)
 - (void)refuse:(NSString *)what;
 @end
-@interface NBEncoder : NBObject
+@interface NBEncoder : NBObject {
+ @public
+ uint32_t _fragmentFormats[16];   // the Metal pixel format of each fragment texture slot, 0 where none is bound (NATIVE_METAL_SKIP_FORMAT)
+ BOOL _skipPipeline;              // the render pipeline set now is one NATIVE_METAL_SKIP_PIPELINE leaves out
+}
 @property(nonatomic) NmbEncoder *handle;
 @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
 @property(nonatomic,strong) NSMutableArray *dumpEntries;   // its NATIVE_METAL_DUMP_CB targets, given its label at endEncoding
@@ -1977,6 +2031,7 @@ static void writeDrawStats() {
            [NSString stringWithFormat:@"kernel %u texture %lu",_commandBuffer.dumpKernels,(unsigned long)index]);
   if(_commandBuffer.dumpTargets.count>before)[_dumpEntries addObject:_commandBuffer.dumpTargets.lastObject];
  }
+ if(stage==2 && index<16)_fragmentFormats[index]=texture?(uint32_t)[(NBTexture *)texture descriptor].format:0;
  if(texture)[_commandBuffer.resourceOwners addObject:texture];
  [self dumpBind:texture index:index stage:stage+4];
  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
@@ -2071,6 +2126,7 @@ static void writeDrawStats() {
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
  if(dumpRange().first)self.dumpPipeline=state;
+ _skipPipeline=((NBRenderPipeline *)state).skipDraws;
  if(gDrawStats)[self noteState:kDSPipeline key:0 object:(__bridge const void *)state value:0];
  ENCODE([self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"]);
 }
@@ -2168,6 +2224,8 @@ static void writeDrawStats() {
 }
 // NATIVE_METAL_SKIP_DRAWS=PASS:FIRST:LAST: every command buffer's render pass PASS (counted from 1) leaves out its draws FIRST..LAST
 // (counted from 1), to find which draws make what a frame shows.
+// NATIVE_METAL_SKIP_FORMAT=N: every draw with a fragment texture of Metal pixel format N bound leaves out, in whichever pass and place.
+// NATIVE_METAL_SKIP_PIPELINE=PATTERN[/PATTERN...]: every draw made with a render pipeline whose label matches leaves out (see skipPipelineLabel).
 - (BOOL)skipDraw {
  struct Skip {unsigned pass,first,last;};
  static const Skip skip=[]{
@@ -2175,7 +2233,10 @@ static void writeDrawStats() {
   if(v && sscanf(v,"%u:%u:%u",&s.pass,&s.first,&s.last)!=3)s.pass=0;
   return s;
  }();
+ static const uint32_t skipFormat=[]{const char *v=getenv("NATIVE_METAL_SKIP_FORMAT");return v?(uint32_t)strtoul(v,nullptr,10):0u;}();
  const uint32_t index=++self.drawIndex;
+ if(_skipPipeline)return YES;
+ if(skipFormat)for(unsigned i=0;i<16;i++)if(_fragmentFormats[i]==skipFormat)return YES;
  return skip.pass && self.commandBuffer.dumpPasses==skip.pass && index>=skip.first && index<=skip.last;
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
@@ -2529,7 +2590,7 @@ static char kUserDictionaryKey;
 - (void)setResponsibleTaskIDs:(const void *)ids count:(NSUInteger)count {(void)ids;(void)count;}
 - (instancetype)init {
  if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
- if(self){createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();sampleWindowOpen();}
+ if(self){createdUs=nowUs();submitCpuBegin=submitCpuEnd=-1;createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();sampleWindowOpen();}
  return self;
 }
 - (void)dealloc {nmb_command_buffer_release(_handle);}
@@ -2788,6 +2849,7 @@ static char kUserDictionaryKey;
 }
 // The runtime's half of a commit, on the encoding thread after the command buffer's encoders.
 - (void)submit {
+ submitBeginUs=nowUs();submitCpuBegin=cpuNumberNow();
  if(!self.encodeFailure) {
   flushSurfaces(_surfaces);
   if(gLogTextures)dumpSurfacesOnce(_surfaces,_resourceOwners);
@@ -2798,6 +2860,7 @@ static char kUserDictionaryKey;
   if(nmb_command_buffer_on_completed(_handle,completed,context) &&
      nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle)) {
    const auto range=dumpRange();
+   submitEndUs=nowUs();submitCpuEnd=cpuNumberNow();
    self.submitted=YES;
    if(appIndex && range.first && appIndex>=range.first && appIndex<(uint64_t)range.first+range.second)dumpReadback(self,appIndex);
    [self fireEarly];return;
@@ -2878,6 +2941,16 @@ static void completed(void *context) {
   CommitRecord &r=gCommitRing[commandBuffer.commitIndex%32];
   if(r.index==commandBuffer.commitIndex) {
    r.callbackUs=took;r.gpuUs=gpuUs;r.gpuStartUs=gpuStartUs;
+   {
+    TimelineRecord &t=gTimeline[gTimelineCount++%kTimeline];
+    t.committedUs=r.committedUs;t.ageUs=(uint32_t)std::min<uint64_t>(r.ageUs,0xffffffffu);t.gpuUs=(uint32_t)std::min<uint64_t>(gpuUs,0xffffffffu);
+    t.callbackUs=(uint32_t)std::min<uint64_t>(took,0xffffffffu);t.startUs=(int32_t)std::max<int64_t>(-1,std::min<int64_t>(gpuStartUs,0x7fffffff));
+    t.passes=(uint16_t)std::min<uint32_t>(r.work.passes,65535);t.draws=(uint16_t)std::min<uint32_t>(r.work.draws,65535);t.kpx=(uint32_t)(r.work.pixels>>10);
+    t.replayUs=commandBuffer->submitBeginUs>=r.committedUs?(uint32_t)std::min<uint64_t>(commandBuffer->submitBeginUs-r.committedUs,0xffffffffu):0;
+    t.submitUs=commandBuffer->submitEndUs>=commandBuffer->submitBeginUs?(uint32_t)std::min<uint64_t>(commandBuffer->submitEndUs-commandBuffer->submitBeginUs,0xffffffffu):0;
+    t.scheduledUs=(int32_t)std::max<int64_t>(-1,std::min<int64_t>(r.scheduledUs,0x7fffffff));
+    t.cpuAtReplay=commandBuffer->submitCpuBegin;t.cpuAtSubmit=commandBuffer->submitCpuEnd;
+   }
    {
     traceStartWriter();traceNote(commandBuffer->createTid);
     if(commandBuffer->commitTid!=commandBuffer->createTid)traceNote(commandBuffer->commitTid);
@@ -3958,7 +4031,8 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
   if(error)*error=nbError([@"render pipeline: " stringByAppendingString:why]);
   return nil;
  }
- NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;
+ NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;state.label=d.label;gPipelines++;if(error)*error=nil;
+ state.skipDraws=skipPipelineLabel(d.label);
  if(dumpRange().first)state.dumpInfo=renderDumpInfo(d);
  return (id<MTLRenderPipelineState>)state;
 }
@@ -4140,6 +4214,12 @@ extern "C" bool native_bridge_metal_shader_cache_stats(NmbShaderCacheStats *out)
 }
 extern "C" bool native_bridge_metal_work_stats(uint64_t out[10]) {
  return gDevice && nmb_device_work_stats(gDevice,out);
+}
+extern "C" bool native_bridge_metal_texture_counts(uint64_t out[8]) {
+ return gDevice && nmb_device_texture_counts(gDevice,out);
+}
+extern "C" size_t native_bridge_metal_message_kind(size_t index,uint64_t *count,char *out,size_t size) {
+ return nmb_message_kind(index,count,out,size);
 }
 
 extern "C" size_t native_bridge_metal_status(char *out,size_t size) {
@@ -4325,6 +4405,29 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
    if(k<4)row("E%u age=%lluus scheduled=%lldus",r.index,(unsigned long long)r.ageUs,(long long)r.scheduledUs);
   }
  }
+ return at;
+}
+
+// One line of the timeline: up to five command buffers from *cursor on, "t age start gpu ctc rp.dr.kpx rep.sub.sch.ca.cb" each, joined by ';'. t is the commit
+// time on the uptime clock (CLOCK_UPTIME_RAW), age creation-to-commit, start the delay from the commit to the GPU's first timestamp (-1: not measured), gpu
+// the GPU's time, ctc commit-to-callback; all in units of 100 us. rp, dr and kpx are the render passes, draws and thousands of pixels it drew. The last
+// field is where the commit's time went before the GPU: rep the delay until the encoding thread began the commit (it replays the encoders' calls first,
+// and what other command buffers queued before), sub how long the commit took it (the runtime recording and submitting), sch the delay to the runtime's
+// "scheduled" callback (-1: none yet), then ca and cb, the cores that thread was on at the start and at the end of the commit (-1: unknown). Advances *cursor and
+// returns the length written, 0 when nothing newer is there.
+extern "C" size_t native_bridge_metal_timeline(uint64_t *cursor,char *out,size_t size) {
+ std::lock_guard<std::mutex> lock(gCommitLock);
+ if(gTimelineCount>*cursor+kTimeline)*cursor=gTimelineCount-kTimeline;   // the oldest records were overwritten
+ size_t at=0;
+ for(unsigned n=0;n<5 && *cursor<gTimelineCount;n++) {
+  const TimelineRecord &r=gTimeline[*cursor%kTimeline];
+  const int w=snprintf(out+at,size-at,"%s%llu %u %d %u %u %u.%u.%u %u.%u.%d.%d.%d",n?";":"",(unsigned long long)(r.committedUs/100),r.ageUs/100,
+   r.startUs<0?-1:(int)(r.startUs/100),r.gpuUs/100,r.callbackUs/100,(unsigned)r.passes,(unsigned)r.draws,r.kpx,
+   r.replayUs/100,r.submitUs/100,r.scheduledUs<0?-1:r.scheduledUs/100,(int)r.cpuAtReplay,(int)r.cpuAtSubmit);
+  if(w<0 || (size_t)w>=size-at)break;
+  at+=(size_t)w;++*cursor;
+ }
+ if(size)out[at<size?at:size-1]=0;   // a record that did not fit is left for the next line, not half printed
  return at;
 }
 

@@ -54,6 +54,9 @@ struct NmbShaderCacheStats {
 };
 bool nmb_device_shader_cache_stats(const NmbDevice *, struct NmbShaderCacheStats *);
 size_t nmb_last_warning(char *out, size_t size);
+/* The index'th distinct message the runtime's sink heard (digits masked in the key): its first text, with its id, copied to out (the full
+ * length returned, 0 past the last), how many came in *count. */
+size_t nmb_message_kind(size_t index, uint64_t *count, char *out, size_t size);
 bool nmb_device_max_threads_per_threadgroup(const NmbDevice *, uint64_t out[3]);
 /* Device queries the runtime answers by Metal selector: Apple's private counts and flags where the device has an answer of its own,
  * and the public queries. A selector's kind says its result and argument. */
