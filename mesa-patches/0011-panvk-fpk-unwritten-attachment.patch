@@ -1,0 +1,91 @@
+PanVK (CSF): let a draw kill the fragments of earlier draws (forward pixel kill, FPK) although it leaves a bound color attachment unwritten.
+
+The rule so far was: a draw may kill only if it writes every bound color attachment. CoreAnimation's passes bind a memoryless, write-masked second color
+attachment next to the one they fill, so none of their opaque full-screen fills could kill the fills before it: all of them were shaded (4 or 5 per pass,
+about 1.6 ms each at 750 MHz; a heavy pass took 7.8 ms, of which 7.2 were these fills).
+
+The condition is not needed on a Mali-G610: a fragment kills an earlier one only when its draw writes at least the attachments the earlier fragment's draw
+writes (the draws' render-target masks, which the previous patch sets from what the draw really writes). Measured on the RK3588 board with a benchmark
+that draws a heavy victim into one or both of two targets and four constant killers into one or both (all 9 pairs of write sets, 2 targets): a victim is
+killed (the pass gets 0.5 ms cheaper than the victim alone) exactly when the killers write a superset of its set, and in the other 4 pairs the targets only
+the victim writes keep every pixel of it (0 of 2041088 differ from the victim alone), with FPK allowed for the killers. In the UI the median command
+buffer of a swipe dropped from 14.1 to 9.5 ms of GPU time.
+
+PANVK_FPK=bound restores the old rule (an A/B switch; the plugin passes the boot-arg mali-panvk-fpk=bound on).
+
+--- a/src/panfrost/vulkan/panvk_cmd_draw.h
++++ b/src/panfrost/vulkan/panvk_cmd_draw.h
+@@ -10,6 +10,9 @@
+ #error "PAN_ARCH must be defined"
+ #endif
+ 
++#include <stdlib.h>
++#include <string.h>
++
+ #include "panvk_blend.h"
+ #include "panvk_cmd_desc_state.h"
+ #include "panvk_cmd_query.h"
+@@ -40,6 +43,22 @@
+    struct panvk_image_view *dst_iview;
+ };
+ 
++/* PANVK_FPK=bound: a draw may kill the fragments of earlier draws (forward pixel kill, FPK) only if it writes every
++ * color attachment that is bound, which is what this driver used to require of every draw. Without it a draw that
++ * leaves a bound attachment unwritten may kill too. On a Mali-G610 a fragment kills an earlier one only when its draw
++ * writes at least the attachments the earlier fragment's draw writes, so nothing a killed fragment wrote to an
++ * attachment the killer leaves alone is lost (measured for every pair of write sets of two attachments: a heavy draw
++ * writing attachment 1 survives four fills that write attachment 0 only, and those fills kill each other).
++ * Core Animation's passes bind a memoryless, write-masked second color attachment next to the one they fill, and with
++ * the old rule every one of their overdrawn opaque fills was shaded. */
++static inline bool
++panvk_fpk_needs_all_rts_from_env(void)
++{
++   const char *v = getenv("PANVK_FPK");
++
++   return v && !strcmp(v, "bound");
++}
++
+ struct panvk_rendering_state {
+    VkRenderingFlags flags;
+    uint32_t layer_count;
+@@ -47,6 +66,9 @@
+    enum u_tristate first_provoking_vertex;
+ 
+    enum vk_rp_attachment_flags bound_attachments;
++
++   /* PANVK_FPK=bound, read when the render pass instance begins (see panvk_fpk_needs_all_rts_from_env) */
++   bool fpk_needs_all_rts;
+    struct {
+       struct panvk_image_view *iviews[MAX_RTS];
+       /* If non-null, preload_iviews[i] overrides iviews[i] for preloads. */
+--- a/src/panfrost/vulkan/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+@@ -569,6 +569,7 @@
+    memset(&render->s_attachment, 0, sizeof(render->s_attachment));
+    memset(&render->fb, 0, sizeof(render->fb));
+    render->bound_attachments = 0;
++   render->fpk_needs_all_rts = panvk_fpk_needs_all_rts_from_env();
+ 
+    const VkMultisampledRenderToSingleSampledInfoEXT *ms2ss_info =
+       vk_find_struct_const(pRenderingInfo,
+--- a/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+@@ -2018,7 +2018,9 @@
+             }
+ 
+             cfg.allow_forward_pixel_to_kill =
+-               fs->info.fs.can_fpk && !(rt_mask & ~rt_written) &&
++               fs->info.fs.can_fpk &&
++               (!cmdbuf->state.gfx.render.fpk_needs_all_rts ||
++                !(rt_mask & ~rt_written)) &&
+                !(rt_read & rt_written) && !alpha_to_coverage &&
+                !cmdbuf->state.gfx.cb.info.any_dest_read;
+ 
+@@ -2985,6 +2987,7 @@
+    memset(&render->z_attachment, 0, sizeof(render->z_attachment));
+    memset(&render->s_attachment, 0, sizeof(render->s_attachment));
+    cmdbuf->state.gfx.render.bound_attachments = 0;
++   render->fpk_needs_all_rts = panvk_fpk_needs_all_rts_from_env();
+ 
+    render->view_mask = inheritance_info->viewMask;
+    render->layer_count = inheritance_info->viewMask ?

@@ -14,7 +14,7 @@ backboardd -> AGXAccelerator -> NativeMaliMetal plug-in -> metal2vulkan bridge (
 | Path | Contents |
 | --- | --- |
 | `darwin-drm/` | The libdrm stand-in: DRM ioctl numbers and structures, `drmIoctl`, syncobj and mmap-offset emulation on top of `mali_uapi.h` |
-| `mesa-patches/` | Eight patches on Mesa 26.1-devel (PanVK for Darwin, host-pointer import, external buffers, rasterization-order access, no host copy for compressed formats, masked render targets that are not written) |
+| `mesa-patches/` | Eleven patches on Mesa 26.1-devel (PanVK for Darwin, host-pointer import, external buffers and images, rasterization-order access, no host copy for compressed formats, masked render targets that are not written, the 64-bit DRM modifier list, forward pixel kill past an unwritten attachment) |
 | `mesa-build/` | Scripts that build LLVM 20, SPIRV tools, host Mesa tools and finally `libvulkan_panfrost.dylib` for iOS; `README.md` explains the order |
 | `metal-plugin/` | `NativeMaliMetalPlugin.mm`, the Metal front end, the Rust bridge, a metal2vulkan patch, `make-addon.py` that packs the plug-in into the kernel's GPU add-on |
 | `usertest/` | Stand-alone iOS test programs (compute, render, Vulkan triangle) that the kernel can run as the init process (`evb10-exec=1`) |
