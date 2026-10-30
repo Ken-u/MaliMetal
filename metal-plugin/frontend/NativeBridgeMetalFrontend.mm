@@ -175,7 +175,7 @@ static std::atomic<uint64_t> gCompileCached;   // requests the shader cache answ
 static Timed gTimeWaitScheduled,gTimeWaitCompleted;
 static Timed gTimeResourceWait;
 static std::atomic<uint64_t> gResourceChecks,gResourceSkipped;
-static Timed gTimeSurfaceFlush;
+static Timed gTimeSurfaceFlush,gTimeSurfaceWait;
 static std::atomic<uint64_t> gSurfaceFlushBytes,gSurfaceFlushDuplicates;
 struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;};
 struct CommitRecord {uint64_t committedUs=0,callbackUs=0,ageUs=0,gpuUs=0;int64_t scheduledUs=-1,gpuStartUs=-1;uint32_t index=0;EncodedWork work={};};
@@ -1148,7 +1148,7 @@ static constexpr bool kSurfaceFlush=true;
 #endif
 // Diagnostic: while /private/var/ngpu/debug/no-surface-flush exists when the process starts, no surface is flushed here either.
 static const bool gSkipSurfaceFlush=access("/private/var/ngpu/debug/no-surface-flush",F_OK)==0;
-static void flushSurfaces(NSMutableSet *surfaces) {
+static void flushSurfaces(NSSet *surfaces) {
  if(!kSurfaceFlush || !surfaces.count || gSkipSurfaceFlush)return;
  std::vector<std::pair<uintptr_t,size_t>> ranges;
  ranges.reserve(surfaces.count);
@@ -1163,6 +1163,55 @@ static void flushSurfaces(NSMutableSet *surfaces) {
   gSurfaceFlushBytes+=it->second;gTimeSurfaceFlush.add(began);
   probeSurface(it->first,it->second);
  }
+}
+// NATIVE_METAL_ASYNC_FLUSH=1 (boot-arg mali-aflush=1): the flush of a command buffer's render targets that its submission does before it hands the work
+// to the runtime (-submit, on the encoding thread, after the replay of every encoder) starts when the commit is made (-commit: every encoder exists by then,
+// so the surface set is final) on a thread of its own, and the submission waits for it. The same flush of the same surfaces, before the same submit; it
+// runs beside the replay (milliseconds of it) instead of after it.
+struct SurfaceFlush {
+ NSSet *surfaces;
+ std::mutex lock;
+ std::condition_variable done;
+ bool finished=false;
+};
+static bool asyncFlushWanted() {
+ static const bool wanted=[]{const char *value=getenv("NATIVE_METAL_ASYNC_FLUSH");return value && value[0]=='1';}();
+ return wanted && kSurfaceFlush && !gSkipSurfaceFlush;
+}
+static std::shared_ptr<SurfaceFlush> startSurfaceFlush(NSSet *surfaces) {
+ struct Queue {std::mutex lock;std::condition_variable work;std::deque<std::shared_ptr<SurfaceFlush>> jobs;};
+ static Queue *queue=[]{
+  Queue *q=new Queue;
+  pthread_t id;pthread_attr_t attr;pthread_attr_init(&attr);
+  pthread_attr_set_qos_class_np(&attr,QOS_CLASS_USER_INTERACTIVE,0);
+  pthread_create(&id,&attr,[](void *arg)->void * {
+   Queue &q=*(Queue *)arg;
+   pthread_setname_np("native-metal-flush");
+   std::unique_lock<std::mutex> lock(q.lock);
+   for(;;) {
+    q.work.wait(lock,[&]{return !q.jobs.empty();});
+    std::shared_ptr<SurfaceFlush> job=q.jobs.front();q.jobs.pop_front();
+    lock.unlock();
+    @autoreleasepool {flushSurfaces(job->surfaces);}
+    {std::lock_guard<std::mutex> guard(job->lock);job->finished=true;}
+    job->done.notify_all();
+    lock.lock();
+   }
+   return nullptr;
+  },q);
+  pthread_detach(id);
+  return q;
+ }();
+ auto job=std::make_shared<SurfaceFlush>();
+ job->surfaces=[surfaces copy];
+ {std::lock_guard<std::mutex> guard(queue->lock);queue->jobs.push_back(job);}
+ queue->work.notify_one();
+ return job;
+}
+static void waitSurfaceFlush(const std::shared_ptr<SurfaceFlush> &job) {
+ const uint64_t began=nowUs();
+ {std::unique_lock<std::mutex> guard(job->lock);job->done.wait(guard,[&]{return job->finished;});}
+ gTimeSurfaceWait.add(began);
 }
 static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,bool surface) {
  NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
@@ -1657,6 +1706,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
  int8_t submitCpuBegin,submitCpuEnd;   // and the core that thread was on at each (-1: not reached)
  BOOL earlyEligible;   // made by the render server's thread: its completed handlers may run at submission (see fireEarly)
  std::vector<WatchedSource> watched;
+ std::shared_ptr<SurfaceFlush> flushJob;   // the commit's render-target flush under way on its own thread (asyncFlushWanted)
 }
 @property(nonatomic) NmbCommandBuffer *handle;
 @property(nonatomic,strong) NBQueue *queue;
@@ -1830,6 +1880,30 @@ struct EncodeThread {
 };
 static thread_local bool tOnEncodeThread;
 static thread_local EncodeBatch *tBatch;
+// NATIVE_METAL_ENCODE_PRIORITY=N (boot-arg mali-epri=N): the encoding thread runs at scheduler priority N instead of the interactive QoS tier's 46, which is
+// the render server's display thread's and SpringBoard's too. A wake of the encoding thread that finds every fast core running such a thread has nothing to
+// preempt, and waits or lands on an efficiency core, where the replay takes two to three times as long (the tail of the heavy command buffers). The thread
+// gives up its QoS to be set this way (the kernel drops a thread's QoS when another policy is applied), and the answer is printed on the console.
+static void encodeThreadPriority() {
+ const char *value=getenv("NATIVE_METAL_ENCODE_PRIORITY");
+ const int target=value?atoi(value):0;
+ if(target<=0)return;
+ const thread_t self=mach_thread_self();
+ auto basePriority=[self]()->int {
+  thread_extended_info_data_t info={};mach_msg_type_number_t count=THREAD_EXTENDED_INFO_COUNT;
+  return thread_info(self,THREAD_EXTENDED_INFO,reinterpret_cast<thread_info_t>(&info),&count)==KERN_SUCCESS?info.pth_priority:-1;
+ };
+ thread_precedence_policy_data_t policy={0};
+ kern_return_t result=thread_policy_set(self,THREAD_PRECEDENCE_POLICY,reinterpret_cast<thread_policy_t>(&policy),THREAD_PRECEDENCE_POLICY_COUNT);
+ const int task=basePriority();
+ if(result==KERN_SUCCESS && task>=0) {
+  policy.importance=target-task;
+  result=thread_policy_set(self,THREAD_PRECEDENCE_POLICY,reinterpret_cast<thread_policy_t>(&policy),THREAD_PRECEDENCE_POLICY_COUNT);
+ }
+ char text[160];
+ snprintf(text,sizeof text,"encode thread priority: the task's %d, wanted %d (importance %d), now %d, result %d",task,target,policy.importance,basePriority(),(int)result);
+ forwardConsole(text);
+}
 static EncodeThread &encodeThread() {
  static EncodeThread *thread=[]{
   EncodeThread *t=new EncodeThread;
@@ -1838,6 +1912,7 @@ static EncodeThread &encodeThread() {
   pthread_create(&id,&attr,[](void *arg)->void * {
    EncodeThread &t=*(EncodeThread *)arg;tOnEncodeThread=true;
    pthread_setname_np("native-metal-encode");
+   encodeThreadPriority();
    std::unique_lock<std::mutex> lock(t.lock);
    for(;;) {
     t.work.wait(lock,[&]{return !t.batches.empty();});
@@ -2844,6 +2919,7 @@ static char kUserDictionaryKey;
  dispatch_group_enter(_handlers);
  dispatch_group_enter(_schedulingHandlers);
  @synchronized(gInFlight){[gInFlight addObject:self];}
+ if(asyncFlushWanted() && _surfaces.count)flushJob=startSurfaceFlush(_surfaces);
  ENCODE([self submit]);
  encodeFlush();
 }
@@ -2851,7 +2927,7 @@ static char kUserDictionaryKey;
 - (void)submit {
  submitBeginUs=nowUs();submitCpuBegin=cpuNumberNow();
  if(!self.encodeFailure) {
-  flushSurfaces(_surfaces);
+  if(flushJob){waitSurfaceFlush(flushJob);flushJob.reset();}else flushSurfaces(_surfaces);
   if(gLogTextures)dumpSurfacesOnce(_surfaces,_resourceOwners);
   for(WatchedSource &source:watched){source.hash=hashSource(source.bytes,source.length);gSourcesWatched[source.surface]++;}
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
@@ -4345,6 +4421,8 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("J surface cache n=%llu bytes=%llu dup=%llu us=%llu max=%llu",(unsigned long long)gTimeSurfaceFlush.count.load(),
   (unsigned long long)gSurfaceFlushBytes.load(),(unsigned long long)gSurfaceFlushDuplicates.load(),
   (unsigned long long)gTimeSurfaceFlush.total.load(),(unsigned long long)gTimeSurfaceFlush.slowest.load());
+ row("J surface flush waited n=%llu us=%llu max=%llu",(unsigned long long)gTimeSurfaceWait.count.load(),(unsigned long long)gTimeSurfaceWait.total.load(),
+  (unsigned long long)gTimeSurfaceWait.slowest.load());
  row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu",(unsigned long long)gNoCopyAll.load(),(unsigned long long)gNoCopyReleased.load(),
   (unsigned long long)gNoCopyMade.load(),
   (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load());

@@ -30,6 +30,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include "NativeBridgeMetalFrontend.h"
 #include "bridge/NativeMetalBridge.h"
 #include "mali_uapi.h"
@@ -316,6 +317,7 @@ void installFaultHandler() {
 
 bool stacksWanted();
 void *stackThread(void *);
+void *gIcdHandle;   // the driver library, loaded in openDevice: what it can say about its calls into the kernel driver
 
 __attribute__((constructor)) void bundleLoaded() {
     mlog("metal: bundle loaded in %s (pid %d)", getprogname(), getpid());
@@ -403,6 +405,15 @@ void *statusThread(void *) {
             mlog("status: L lin %llu/%llu/%llu sh %llu cp %llu bk %llu pass %llu/%llu", (unsigned long long)tc[0], (unsigned long long)tc[1],
                  (unsigned long long)tc[2], (unsigned long long)tc[3], (unsigned long long)tc[4], (unsigned long long)tc[5], (unsigned long long)tc[6],
                  (unsigned long long)tc[7]);
+        // What the render server's calls into the kernel driver cost it, by the driver shim's own clock around each (selector:count total/longest in ms since
+        // start; 8 is the group submit, 3 and 5 the buffer and the VM bind): the difference of two lines over the group submits made is what one costs the caller.
+        {
+            typedef size_t (*TimingFn)(char *, size_t);
+            TimingFn timing = gIcdHandle ? reinterpret_cast<TimingFn>(dlsym(gIcdHandle, "drm_darwin_timing")) : nullptr;
+            char text[240];
+            if (timing && timing(text, sizeof text))
+                mlog("status: C calls:%.200s", text);
+        }
     }
     return nullptr;
 }
@@ -411,14 +422,36 @@ void *statusThread(void *) {
 // ties the two clocks together) and then one "tl" line per up to five command buffers completed since: "t age start gpu ctc rp.dr.kpx rep.sub.sch.ca.cb" each (see
 // native_bridge_metal_timeline), times in units of 100 us (t: the commit's time on the uptime clock). The kernel's "display gaps" lines carry the frames' times on the same clock, so the command buffers
 // of a hitch can be told from the frames the panel got.
+// The process's named threads with their kernel thread ids, one "tl thread ID NAME" line each: the kernel's scheduler lines (sched-slowcpus) and its
+// per-thread sampler know threads by id only.
+void logThreadIds() {
+    thread_act_array_t threads = nullptr;
+    mach_msg_type_number_t count = 0;
+    if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS)
+        return;
+    for (mach_msg_type_number_t i = 0; i < count; ++i) {
+        char name[64] = {};
+        thread_identifier_info_data_t ident = {};
+        mach_msg_type_number_t identCount = THREAD_IDENTIFIER_INFO_COUNT;
+        if (pthread_t p = pthread_from_mach_thread_np(threads[i]))
+            pthread_getname_np(p, name, sizeof name);
+        if (name[0] && thread_info(threads[i], THREAD_IDENTIFIER_INFO, reinterpret_cast<thread_info_t>(&ident), &identCount) == KERN_SUCCESS)
+            mlog("tl thread %#llx %s", (unsigned long long)ident.thread_id, name);
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads), count * sizeof(thread_t));
+}
+
 void *timelineThread(void *) {
     uint64_t cursor = 0;
-    for (;;) {
+    for (unsigned round = 0;; ++round) {
         usleep(2000000);
         mlog("tl sync %llu", (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000));
         char text[240];
         while (native_bridge_metal_timeline(&cursor, text, sizeof text))
             mlog("tl %s", text);
+        if (round == 10 || round == 40)
+            logThreadIds();
     }
     return nullptr;
 }
@@ -629,6 +662,14 @@ void startDumpFromBootArgs() {
     // An A/B switch for the frame-rate measurements.
     if (bootArgValue("mali-panvk-fpk", value, sizeof value))
         setenv("PANVK_FPK", value, 1);
+    // mali-aflush=1: the cache flush of a command buffer's render-target surfaces, which its submission does after the replay of its encoders (about half
+    // a millisecond of the encoding thread's time on the way to the GPU), runs on a thread of its own from the commit on and the submission only waits for it.
+    if (bootArgValue("mali-aflush", value, sizeof value))
+        setenv("NATIVE_METAL_ASYNC_FLUSH", value, 1);
+    // mali-epri=N: the encoding thread runs at scheduler priority N (the interactive QoS tier it has otherwise is 46, like SpringBoard's and the display
+    // thread's) so that its wake can preempt those where every fast core is busy with them (NATIVE_METAL_ENCODE_PRIORITY).
+    if (bootArgValue("mali-epri", value, sizeof value))
+        setenv("NATIVE_METAL_ENCODE_PRIORITY", value, 1);
     // mali-bifrost-debug=shaderdb or statsfull: BIFROST_MESA_DEBUG for the render server's shader compiler. Every shader the driver compiles prints
     // its statistics to standard error (the console below): shaderdb one line (instructions, cycles of the arithmetic, load/store, varying and
     // texture pipes, work registers, threads, spills), statsfull a block with the pipe each shader is bound by.
@@ -778,24 +819,45 @@ void *cpuThread(void *) {
 // A sampling profiler for the render server's display thread (the CPU-bound one): 250 times a second it stops the thread, reads its program
 // counter and walks the frame pointers, and every six seconds says where the samples fell: by image (self and inclusive of callers) and by
 // function. It is the answer to "QuartzCore, our plugin, the Vulkan driver or the C library?".
-std::string imageOf(const void *address, std::string *symbol, uintptr_t *offset) {
+// `start`, if asked for: the image offset of the symbol the address is in (the offset itself where dladdr names none).
+std::string imageOf(const void *address, std::string *symbol, uintptr_t *offset, uintptr_t *start = nullptr) {
+    // dladdr walks the image's whole symbol table, which is slow for the big ones (QuartzCore): the samples repeat the same few thousand addresses,
+    // so each thread remembers what it has been told.
+    struct Known {
+        std::string image, symbol;
+        uintptr_t offset, start;
+    };
+    static thread_local std::unordered_map<const void *, Known> cache;
+    auto hit = cache.find(address);
+    if (hit != cache.end()) {
+        *symbol = hit->second.symbol;
+        *offset = hit->second.offset;
+        if (start)
+            *start = hit->second.start;
+        return hit->second.image;
+    }
     Dl_info info = {};
-    if (!dladdr(address, &info) || !info.dli_fname) {
-        *symbol = "?";
-        *offset = 0;
-        return "?";
+    Known known = {"?", "?", 0, 0};
+    if (dladdr(address, &info) && info.dli_fname) {
+        const char *slash = strrchr(info.dli_fname, '/');
+        known.image = slash ? slash + 1 : info.dli_fname;
+        char text[96];
+        if (info.dli_sname && info.dli_sname[0]) {
+            snprintf(text, sizeof text, "%.80s", info.dli_sname);
+        } else {
+            snprintf(text, sizeof text, "+%#lx", (unsigned long)((reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(info.dli_fbase)) >> 8 << 8));
+        }
+        known.symbol = text;
+        known.offset = reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(info.dli_fbase);
+        known.start = info.dli_saddr ? reinterpret_cast<uintptr_t>(info.dli_saddr) - reinterpret_cast<uintptr_t>(info.dli_fbase) : known.offset;
     }
-    const char *slash = strrchr(info.dli_fname, '/');
-    std::string image = slash ? slash + 1 : info.dli_fname;
-    char text[96];
-    if (info.dli_sname && info.dli_sname[0]) {
-        snprintf(text, sizeof text, "%.80s", info.dli_sname);
-    } else {
-        snprintf(text, sizeof text, "+%#lx", (unsigned long)((reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(info.dli_fbase)) >> 8 << 8));
-    }
-    *symbol = text;
-    *offset = reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(info.dli_fbase);
-    return image;
+    if (cache.size() < 200000)
+        cache.emplace(address, known);
+    *symbol = known.symbol;
+    *offset = known.offset;
+    if (start)
+        *start = known.start;
+    return known.image;
 }
 
 // Rust symbols come mangled (v0: _RNv..., legacy: _ZN...); this keeps the last three path segments, enough to tell the functions apart.
@@ -848,7 +910,9 @@ std::string shortName(const std::string &name) {
     return out;
 }
 
-void profileReport(const char *what, std::map<std::string, unsigned> &counts, unsigned total, unsigned entries, unsigned perLine = 3, unsigned nameLength = 46) {
+// `counts`: print the sample counts themselves instead of percentages (what the host adds up over many reports); `tag` says which thread this is.
+void profileReport(const char *what, std::map<std::string, unsigned> &counts, unsigned total, unsigned entries, unsigned perLine = 3, unsigned nameLength = 46,
+                   bool rawCounts = false, const char *tag = "") {
     std::vector<std::pair<unsigned, std::string>> sorted;
     for (auto &entry : counts)
         sorted.push_back({entry.second, entry.first});
@@ -859,30 +923,46 @@ void profileReport(const char *what, std::map<std::string, unsigned> &counts, un
     for (auto &entry : sorted) {
         if (shown >= entries)
             break;
-        const int n = snprintf(line + used, sizeof line - used, "%s%.*s %u%%", inLine ? " | " : "", (int)nameLength, entry.second.c_str(), entry.first * 100 / (total ? total : 1));
+        const int n = rawCounts ? snprintf(line + used, sizeof line - used, "%s%.*s %u", inLine ? " | " : "", (int)nameLength, entry.second.c_str(), entry.first)
+                                : snprintf(line + used, sizeof line - used, "%s%.*s %u%%", inLine ? " | " : "", (int)nameLength, entry.second.c_str(),
+                                           entry.first * 100 / (total ? total : 1));
         if (n <= 0 || used + (size_t)n >= 170)
             break;
         used += (size_t)n;
         ++shown;
         if (++inLine == perLine) {
-            mlog("prof %s: %s", what, line);
+            mlog("prof%s %s: %s", tag, what, line);
             used = 0;
             inLine = 0;
             line[0] = 0;
         }
     }
     if (inLine)
-        mlog("prof %s: %s", what, line);
+        mlog("prof%s %s: %s", tag, what, line);
 }
 
-void *profileThread(void *) {
+// What the sampler looks at: a thread of the process by its pthread name, and the tag its report lines carry ("prof[E] ...").
+struct ProfileTarget {
+    const char *thread;
+    const char *tag;
+};
+
+// mali-profile=1 samples the render server's display thread and the thread that replays the recorded Metal calls (the frontend's "native-metal-encode"),
+// every mali-profile-us microseconds (default 4000). The driver is linked without its local symbols, so for libvulkan_panfrost.dylib the lines
+// "v self" (where the samples were) and "v outer" (the outermost frame in the driver: the Vulkan entry point the plugin called) carry image offsets,
+// which the host names from the linker's map (tools/xnu-probe/prof_report.py).
+void *profileThread(void *argument) {
+    const ProfileTarget *aim = static_cast<const ProfileTarget *>(argument);
+    unsigned intervalUs = 4000;
+    if (char value[16]; bootArgValue("mali-profile-us", value, sizeof value) && atoi(value) >= 200)
+        intervalUs = (unsigned)atoi(value);
     thread_t target = MACH_PORT_NULL;
     pthread_t targetPthread = nullptr;
-    std::map<std::string, unsigned> leafImage, inclusive, leafSymbol, plugin, pluginInclusive;
+    std::map<std::string, unsigned> leafImage, inclusive, leafSymbol, plugin, pluginInclusive, vulkanSelf, vulkanOuter, pluginNearestAt, pluginInclusiveAt;
     unsigned running = 0, samples = 0;
     uint64_t lastReport = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), lastLookup = 0;
     for (;;) {
-        usleep(4000);
+        usleep(intervalUs);
         const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         if (target == MACH_PORT_NULL || now - lastLookup > 10000000000ull) {
             lastLookup = now;
@@ -893,7 +973,7 @@ void *profileThread(void *) {
                 for (mach_msg_type_number_t i = 0; i < count; ++i) {
                     char name[64] = {};
                     pthread_t p = pthread_from_mach_thread_np(threads[i]);
-                    if (p && !found && pthread_getname_np(p, name, sizeof name) == 0 && strcmp(name, "com.apple.coreanimation.display.primary") == 0) {
+                    if (p && !found && pthread_getname_np(p, name, sizeof name) == 0 && strcmp(name, aim->thread) == 0) {
                         found = threads[i];
                         targetPthread = p;
                         continue;
@@ -959,40 +1039,76 @@ void *profileThread(void *) {
                     for (const std::string &name : seen)
                         ++inclusive[name];
                     // which functions of our plugin the sample is under: the nearest one (self + callees) and every one on the stack (inclusive)
-                    std::set<std::string> functions;
+                    std::set<std::string> functions, starts;
                     bool nearest = true;
                     for (unsigned c = 0; c < chainLength; ++c) {
                         const uintptr_t address = chain[c];
                         std::string s2;
-                        uintptr_t o2;
-                        if (imageOf(reinterpret_cast<void *>(address), &s2, &o2) == "NativeMaliMetal") {
+                        uintptr_t o2, start;
+                        if (imageOf(reinterpret_cast<void *>(address), &s2, &o2, &start) == "NativeMaliMetal") {
                             const std::string name = shortName(s2);
-                            if (nearest)
+                            char at[24];
+                            snprintf(at, sizeof at, "%lx", (unsigned long)start);
+                            if (nearest) {
                                 ++plugin[name];
+                                ++pluginNearestAt[at];
+                            }
                             nearest = false;
                             functions.insert(name);
+                            starts.insert(at);
                         }
                     }
                     for (const std::string &name : functions)
                         ++pluginInclusive[name];
+                    for (const std::string &at : starts)
+                        ++pluginInclusiveAt[at];
+                    // the driver's frames, as image offsets: where the sample was, and the outermost frame (the entry point the plugin called)
+                    unsigned outermost = chainLength;
+                    for (unsigned c = 0; c < chainLength; ++c) {
+                        std::string s2;
+                        uintptr_t o2;
+                        if (imageOf(reinterpret_cast<void *>(chain[c]), &s2, &o2) == "libvulkan_panfrost.dylib") {
+                            char key[24];
+                            snprintf(key, sizeof key, "%lx", (unsigned long)o2);
+                            if (c == 0)
+                                ++vulkanSelf[key];
+                            outermost = c;
+                        }
+                    }
+                    if (outermost < chainLength) {
+                        std::string s2;
+                        uintptr_t o2;
+                        imageOf(reinterpret_cast<void *>(chain[outermost]), &s2, &o2);
+                        char key[24];
+                        snprintf(key, sizeof key, "%lx", (unsigned long)o2);
+                        ++vulkanOuter[key];
+                    }
                 }
             }
         }
         if (now - lastReport >= 6000000000ull) {
             lastReport = now;
             if (running >= 25) {
-                mlog("prof: %u running samples of %u (display thread)", running, samples);
-                profileReport("self by image", leafImage, running, 8, 4);
-                profileReport("inclusive images", inclusive, running, 8, 4);
-                profileReport("self by function", leafSymbol, running, 9, 3, 50);
-                profileReport("plugin nearest", plugin, running, 12, 2, 70);
-                profileReport("plugin inclusive", pluginInclusive, running, 14, 2, 70);
+                mlog("prof%s: %u running samples of %u (%s)", aim->tag, running, samples, aim->thread);
+                profileReport("self by image", leafImage, running, 8, 4, 46, false, aim->tag);
+                profileReport("inclusive images", inclusive, running, 8, 4, 46, false, aim->tag);
+                profileReport("self by function", leafSymbol, running, 9, 3, 50, false, aim->tag);
+                profileReport("plugin nearest", plugin, running, 12, 2, 70, false, aim->tag);
+                profileReport("plugin inclusive", pluginInclusive, running, 14, 2, 70, false, aim->tag);
+                profileReport("v self", vulkanSelf, running, 40, 8, 12, true, aim->tag);
+                profileReport("v outer", vulkanOuter, running, 40, 8, 12, true, aim->tag);
+                profileReport("m nearest", pluginNearestAt, running, 40, 8, 12, true, aim->tag);
+                profileReport("m incl", pluginInclusiveAt, running, 60, 8, 12, true, aim->tag);
             }
             leafImage.clear();
             inclusive.clear();
             leafSymbol.clear();
             plugin.clear();
             pluginInclusive.clear();
+            vulkanSelf.clear();
+            vulkanOuter.clear();
+            pluginNearestAt.clear();
+            pluginInclusiveAt.clear();
             running = samples = 0;
         }
     }
@@ -1181,7 +1297,6 @@ bool stacksWanted() {
 
 // A client process lives under a memory limit (200 MB for the poster extensions: "crossed memory high watermark", then jetsam kills it, gpu41), and the
 // GPU's buffers are mapped into it: once a second for the first half minute, the footprint, in MB.
-void *gIcdHandle;   // the driver library, loaded in openDevice: what it can say about its calls into the kernel driver
 
 void logMemory(const char *when) {
     {
@@ -1515,9 +1630,13 @@ id openDevice(unsigned port) {
         if (device && server) {
             pthread_t thread;
             if (bootArgHas("mali-profile=1")) {
+                static const ProfileTarget display = {"com.apple.coreanimation.display.primary", "[D]"};
+                static const ProfileTarget encode = {"native-metal-encode", "[E]"};
                 if (pthread_create(&thread, nullptr, cpuThread, nullptr) == 0)
                     pthread_detach(thread);
-                if (pthread_create(&thread, nullptr, profileThread, nullptr) == 0)
+                if (pthread_create(&thread, nullptr, profileThread, const_cast<ProfileTarget *>(&display)) == 0)
+                    pthread_detach(thread);
+                if (pthread_create(&thread, nullptr, profileThread, const_cast<ProfileTarget *>(&encode)) == 0)
                     pthread_detach(thread);
             }
             if (bootArgHas("mali-timeline=1")) {
