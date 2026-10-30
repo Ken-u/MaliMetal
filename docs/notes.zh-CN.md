@@ -165,6 +165,7 @@ Metal → 插件 → PanVK，**每个进程一个独立的 Mali 连接**：
   转发 stderr 要用 `funopen()` 做一个自定义 `FILE*` 再赋给 `stderr`（见 `consoleWrite()`，180 字符一块 → `mlog`，带互斥）。
 - **boot-args 的字符集和长度**：`UniXNU/scripts/unixnu/payload.py: check_args` 的值只允许 `[A-Za-z0-9_.,/\-]`（没有 `:`、空格），整条命令行 ≤1000 字符；
   默认 boot-args 已有约 960，要加诊断参数得先腾地方：`evb10-bt=x evb10-bt2=x evb10-bt3=x evb10-bt4=x`（省约 38 字符），必要时去掉 `evb10-vop-fence=1`。
+  （2026-10-30 之后 `board.toml` 默认已经去掉 `evb10-ps` 和这四个 `evb10-bt*`，默认是 884 字节，见「帧率（二）」第 9 节。）
   逗号在插件里转成冒号，下划线转空格。
 - 命令缓冲的编号每次运行不一样（锁屏帧的序号会漂），要用宽窗口（`mali-dump=1,40`）加 `mali-dump-draws=1,12`。
 - 内核 printf 超过约 255 字符会丢尾巴，转储每行已经切到 180。
@@ -235,6 +236,8 @@ backboardd 的沙箱会杀掉在 `pipe()` 和「给 fd 2 建文件 / dup2」上�
 起点（`perf1`，修 YCbCr 转换之前）是约 100 ms 一帧、8–10 fps；`perf7` 之后平均交给显示的间隔 26–56 ms。
 **上面全是用 `EXTRA_KERNEL_ARGS` 加的参数量的**（`evb10-vop-direct=1 evb10-vop-fence=1 mali-pll=1 mali-div=1 mali-ycbcr-filter=device`）；`board.toml` 的默认参数没有改，
 **不带这些参数时跑的仍是拷贝式扫描、GPU 198 MHz**。复现：
+
+（这是这一节当时的写法；现在帧率参数都在 `board.toml` 的默认里，新的写法见「帧率（二）」第 9 节。）
 
 ```
 cd uefi-evb10 && ARGS="evb10-touch-demo=120 evb10-vop-direct=1 mali-pll=1 mali-div=1 evb10-vop-fence=1 evb10-bt=x evb10-bt2=x evb10-bt3=x evb10-bt4=x mali-ycbcr-filter=device mali-timeline=1"
@@ -317,3 +320,139 @@ CPLL/2 = 750 MHz）。电压是 UEFI 设的 0.75 V，没有动；厂商的工作
 - 改了 XNU 补丁列表会重建 `.cache/xnu-work`，`prepare-xnu-source.py` 要从 GitHub 重新下 DriverKit 头文件；`env -i` 会丢掉代理环境，构建内核要把 `https_proxy`/`http_proxy` 传进去（`tmp/chain-k.sh`）。
 - `evb10-shot-img` 截图不是瞬间快照（见 1.4）：动画中的帧会撕开，比较要用静态帧。
 
+
+
+## 帧率（二）：编码线程别落到 A55 上，GPU 1 GHz（2026-10-30，`板子运行 gp1 ps0 sl2 sl3 ep1 ep2 ep3 gp2 tk4 soak1`）
+
+标记同上：**[板上]** = 板子上观察到的；**[主机]** = 只在主机上验证的。上一节结尾「还剩什么」之前，`cpumask=0x1f` 之后重放还有约 8 % 落在 A55 上，这是尾巴里最大的一块；这一节把它量清楚、修掉，
+顺手把 GPU 抬到 1 GHz，并记下没有用的东西。**所有数字都是 `evb10-touch-demo=120` 的手势，板子上跑出来的，每个配置只跑了一两次（运行间的波动见下）。**
+
+### 0. 结果 [板上]
+
+**指标换了。** 「手指按下的 0.8 s 里显示的帧数」被触摸到第一帧的延迟卡住（见第 7 节：右滑要 180–200 ms 才出第一帧），节奏再好，右滑也只能读到 48–51 fps，左滑 55–60 fps。
+所以这一节改看三样：**重的命令缓冲（≥ 50 个绘制）从提交到完成的 p50 / p90**、**超过 19.3 ms 的比例**（第 2 节：再长就赶不上 V+2，丢一帧）、**重放落在 A55 上的个数**（时间线 `ca` ≥ 4，`cb_table.py`）。
+手势 3–11（9 个）里相邻帧间隔 > 25 ms 的个数也列出来，但它很少（0–15 个），噪声大。
+
+| 运行 | 配置（所有运行共有：`evb10-vop-direct=1 evb10-vop-fence=1 mali-ycbcr-filter=device cpumask=0x1f mali-aflush=1 mali-timeline=1`，GPU 850 MHz） | fps | 间隔 > 25 ms | 提交→完成 p50 / p90 | > 19.3 ms | 重放在 A55 上 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `gp1` | `evb10-ps=10`（当时 `board.toml` 默认带着的调试采样器） | 53.3 | 3 | 15.7 / 21.0 ms | 13.0 % | 46 / 469（10 %） |
+| `ps0` | `evb10-ps=0` | 52.5 | 9 | 15.2 / 18.5 ms | 6.6 % | 19 / 470（4 %） |
+| `sl2` | ps0 + `sched-slowcpus=0xf0` | 52.5 | 15 | 16.2 / 20.4 ms | 13.6 % | 70 / 434（16 %） |
+| `sl3` | 同 `sl2`（多了调度器的诊断输出） | 53.1 | 12 | 16.1 / 19.7 ms | 12.3 % | 61 / 471（13 %） |
+| `ep1` | ps0 + `mali-epri=50` | 51.8 | 13 | 16.0 / 25.6 ms | 19.2 % | 86 / 469（18 %） |
+| **`ep2`** | ps0 + `mali-epri=50 sched-slowcpus=0xf0` | 53.5 | 3 | **13.7 / 17.3 ms** | **3.5 %** | **2 / 425（0.5 %）** |
+| `ep3` | `ep2` + 栅栏等待每 100 µs 看一次（代码已撤，见第 6 节） | 53.3 | 5 | 14.0 / 17.6 ms | 3.6 % | 9 / 500（1.8 %） |
+| **`gp2`** | `ep2` + `mali-npll=1000`（GPU 1000 MHz） | 54.0 | 4 | **12.7 / 15.6 ms** | **1.6 %** | 6 / 488（1.2 %） |
+| **`v1`** | **提交后的 `board.toml` 默认**（上面这些参数都在默认里，GPU 750 MHz，没有 `evb10-ps`），只加了 `evb10-touch-demo=120 mali-timeline=1` | 52.6 | 11 | 14.9 / 18.9 ms | 8.7 % | 6 / 504（1.2 %） |
+| **`v2`** | `v1` + `mali-pll=3 mali-div=0 mali-npll=1000`，固件按 `docs/reproduce.md` 的步骤重编（`GPU_RAIL_UV=850000`，0.85 V） | 53.8 | 4 | 12.7 / 15.6 ms | 2.5 % | 9 / 511（1.8 %） |
+
+`ep2` 和 `ep3` 是同一个配置跑了两次，三项指标基本一致（3.5 / 3.6 %，A55 上 2 / 9 个），这个差别（对 ps0 的 6.6 % 和其它的 12–19 %）不是运行间噪声。
+手势里面板上的帧间隔基本是一个 vsync：`ep2` 的第 3–11 手势平均间隔 16.6–17.8 ms，`gp2` 的最好一个手势 60.0 fps（48 帧 / 0.8 s，0 个长间隔）。
+
+**GPU 频率的取舍**（`ep3` / `gp2` / `v1` 的配置只差 GPU 频率，A76 都在 2.23 GHz）[板上]：
+
+| GPU | 重命令缓冲的 GPU 时间（中位，`cb_table.py` 的 `gpu50`） | 提交→完成 p50 / p90 | > 19.3 ms | 手势 3–11 的 fps |
+| --- | --- | --- | --- | --- |
+| 750 MHz（默认，0.75 V） | 10.1 ms | 14.9 / 18.9 ms | 8.7 % | 52.6 |
+| 850 MHz（`mali-pll=3 mali-div=0`，NPLL 的固件值；`ep3`，在 0.85 V 的固件上测的，0.75 V 没有测） | 9.1 ms | 14.0 / 17.6 ms | 3.6 % | 53.3 |
+| 1000 MHz（0.85 V，`gp2`；`v2` 是按文档步骤重编的固件，同样 12.7 / 15.6 ms，2.5 %，53.8 fps；`soak1` 12 分钟 1.4–1.9 %） | 7.9 ms | 12.7 / 15.6 ms | 1.6 % | 54.0 |
+
+平均帧率三档差不多（手指按下期间的节奏被触摸到第一帧的延迟和显示的 vsync 卡住），差别在**赶不上期限的帧**：750 MHz 下每 11–12 个重帧丢一个，1 GHz 下约每 40–60 个丢一个。每个配置只有一次 4 分钟的运行（1 GHz 另有 12 分钟的）；`ep3` 和 `gp2` 在 0.85 V 的固件上跑，`v1` 在默认的 0.75 V 固件上跑。
+
+### 1. 为什么重放会落在 A55 上，怎么修 [板上]
+
+**两个事实**：(1) XNU 的 `choose_processor` 有空闲核就用空闲核，不去抢占别的线程。A55（逻辑核 4，`cpumask=0x1f` 之后只剩这一个）几乎总是空闲，所以快核全忙时编码线程 E 就被送到那里；
+(2) 线程倾向回到上次运行的核：`ep1` 里 E 一旦落到 A55，会连着留下（最长连续 20 个命令缓冲，`ps0` 最长 4 个，多数是单个）。A55 上重放 14 ms（A76 上 4 ms），这一帧就丢了：`ep1` 的 56 个 > 21 ms 的重命令缓冲里 51 个在 A55 上。
+
+**两半缺一不可**（上表的 2×2）：
+
+| | 不回避慢核 | `sched-slowcpus=0xf0` |
+| --- | --- | --- |
+| E 优先级不动（UI QoS，46） | `ps0`：4 % 在 A55，6.6 % > 19.3 ms | `sl2/sl3`：13–16 %，12–14 % |
+| E 优先级 50（`mali-epri=50`） | `ep1`：18 %，19.2 % | **`ep2/ep3`：0.5–1.8 %，3.5–3.6 %** |
+
+- **`sched-slowcpus=MASK`**（XNU 补丁 `rk3588-slow-cores.patch`，`UniXNU-rk3588-common`）：给调度器一个「慢核」的逻辑核掩码（A76 优先的编号下 A55 = 4–7 = `0xf0`）。基础优先级 ≥ `sched-slowpri`（默认 37：UI 和 UIN 两个 QoS 类）的线程，
+  有空闲的快核时不去空闲的慢核；没有空闲快核但有快核在跑更不重要的线程（可以抢占的）时，抢占那个快核；也不因为「上次在慢核上跑」回到慢核。所有快核都在跑同级或更高的线程时照旧落到慢核（等快核有时可能比慢核更久）。
+  默认 0 = 不起作用。`sched-slowstat=N` 让维护线程每 N 秒打一行计数。**只开它没有用**：E 是 46，快核上跑的 SpringBoard 线程是 47（前台应用加一），没有可以抢占的，仍然落到 A55，而其它 UI 线程现在也不去 A55 了，反而更挤。
+- **`mali-epri=N`**（插件，`NativeBridgeMetalFrontend.mm` 的 `encodeThreadPriority()`）：用 `THREAD_PRECEDENCE_POLICY` 把 E 的优先级设成 N（任务基础优先级 31 + importance）。控制台会打一行
+  `encode thread priority: the task's 31, wanted 50 (importance 19), now 50, result 0`。50 高于 SpringBoard / locationd 的 47，低于显示线程 D（54–55）和 backboardd 里被提升的线程（63）。**这样 E 会失去 QoS**（回到默认桶），**只开它也没有用**：
+  有空闲的 A55 时调度器不抢占，E 就去 A55，而且更黏（`ep1`）。
+- 合在一起：E 有 47 的线程可抢，又没有路通到 A55（`ep2`：A55 上 2 个）。
+
+**慢核回避的计数（`ep2`，235 s，`sched-slowstat`）[板上]**：基础优先级 ≥ 46 的线程被放置了 205 158 次（约 870 次/s）：27 % 有空闲快核，**71 % 要抢占一个快核**，2.3 %（4 774 次）没有快核可用、落到了 A55。
+最后这些里 SpringBoard 的主线程（47）最多（取样的 220 个事件里 120 个），其次是 locationd 的 CoreMotion 线程；**代价**是这几次 SpringBoard 主线程在慢核上跑，帧节奏上没看到影响（间隔 16.6–17 ms）。
+
+### 2. 快核被谁占着 [板上]
+
+`sl3` 的诊断输出（每次「UI 类线程找不到快核」时记下 8 个核上跑的线程）：SpringBoard 主线程（47）和它的 `uikit.eventfetch`（47）、backboardd 里被提升到 63 的线程、显示线程 D（54–55）、E（50）、
+locationd 的 `CoreMotion`（47）。**内核线程也在里面**：`thread call high #n`（93）和 `thread call kernel-`（92）占了这些时刻快核槽位的 7–11 %（`sl3`、`ep2`）。
+
+其中一个已经量到：触摸驱动（`Evb10Touch.cpp`）每约 11.5 ms 一次 `thread_call`，轮询 I2C5（主控是轮询的，`IODelay(1)` 忙等），**100 kHz 下每次 535 µs**（每 1000 次里最长的一次：`ep3` 1.2 ms、`gp2` 6.4 ms、`soak1` 4.8 ms，包含被抢占的时间），约占一个快核的 4.6 %，优先级 93。
+`evb10-touch-khz=400`（新启动参数，默认 100）：每次 **150 µs**（最长 191 µs），`tk4` 里 I2C 扫描照旧看到 0x14 和 0x5d，Goodix GT1158 的产品号和配置读出来了（`product id 1158`，10 个触点），0 个总线错误。
+**手指真的按上去没有测**（要人动手）；总线是同一条，多读的只是更多字节。
+
+### 3. 调试采样器的代价 [板上]
+
+原来 `board.toml` 默认有的 `evb10-ps=10`（每 10 s 打进程表，加上每个「忙」的进程 12 × 8 行线程栈；现在不在默认里，要用时 `EXTRA_KERNEL_ARGS=evb10-ps=10`）自己是 `kernel_thread_start` 的 95 优先级线程，一次运行多打 3.3 MB（关掉是 0.3 MB），串口 1.5 Mbaud 上忙等。
+`gp1` 对 `ps0`：重放在 A55 上 46 对 19 个，> 19.3 ms 13.0 % 对 6.6 %。**量帧率时别开它**（现在默认就是关的）。 关掉后 `kernel_task` 剩下的主要就是上面的触摸 tick。
+
+### 4. GPU 1 GHz：`mali-npll=1000`（Mali 仓库）[板上]
+
+NPLL 固件设在 850 MHz（M = 425，P = 3，S = 2，VCO 3.4 GHz）。`mali-pll=3 mali-div=0` 是直接用它。`mali-npll=MHz`（400–1100）在切到 NPLL 之前只改乘数 M（`M = MHz × P × 2^S / 24`，1000 MHz = M 500，VCO 4 GHz，
+在 PLL 的 2.25–4.5 GHz 范围内），等锁定位（`CON6[15]`）；没锁住就恢复原来的 M。GPU 此时还没有接到 NPLL，别的东西也不用它。控制台：
+`mali: mali-npll=1000: m 425 -> 500, npll now 1000000 kHz (locked 1, con 0x1f4 0x83)`，GPU 周期计数器探针读到 `1000 MHz`。**电压**：厂商的工作点表里 ≤ 800 MHz 要 0.75 V、900 MHz 要 0.80 V、1 GHz 要 0.85 V；没有调频，所以 `vdd_gpu_s0` 开机时一次设好。
+UEFI 里它现在是构建选项 `GPU_RAIL_UV`（微伏，默认 750000 = 0.75 V，`RockchipPlatformLib.c`）：跑 1 GHz 要 `GPU_RAIL_UV=850000` 重编固件。**默认是 750 MHz / 0.75 V**（`board.toml` 的 `mali-pll=1 mali-div=1`），1 GHz 是选项，步骤写在 `UniXNU-evb10/docs/reproduce.md`。
+效果（`gp2` 对 `ep2`）：命令缓冲 GPU 时间中位 9.1 → 7.9 ms，提交→完成 p50 13.7 → 12.7 ms，p90 17.3 → 15.6 ms，> 19.3 ms 3.5 → 1.6 %。重通道的时间照旧跟时钟走。
+**稳定性（`soak1`，12 分钟，`gp2` 的参数）[板上]**：81 个演示手势、3 553 个重命令缓冲，没有 panic、没有 `STALL group`，每 10 s 一行的 `vkpipe` 状态到最后一行（717 s，`n=76`）都是 `failed=0`；按时间四等分（`cb_table.py soak1 --split 4`）：
+提交→完成 p50 12.5–12.6 ms、p90 15.7–15.9 ms、> 19.3 ms 占 1.4–1.9 %，GPU 时间中位 7.9 ms，重放起在 A55 上的 9–15 / 888（共 49 个，1.4 %），**没有随时间变慢的趋势**。
+手指按下 0.8 s 的帧率，81 个手势平均 53.3 fps（左滑 55–60，右滑 48–52）。触摸 tick（100 kHz）6 万次平均 553 µs、最长 1.26 ms。`wdt-kick=1800` 在 30 分钟后停止喂狗，比这更长的采集要改它。
+
+### 5. UEFI：A76 的电压表是全零（`uefi-evb10`，`UniXNUEvb10.dsc`）[主机] + [板上]
+
+`PcdRk860xRegulatorTags|{ $(SCMI_CLK_CPUB01), $(SCMI_CLK_CPUB23), $(SCMI_CLK_NPU) }`：`SCMI_CLK_NPU` 只是 C 宏（`ScmiDefinitions.h`），DSC 里没有这个宏，整个数组编译出来是 `{0, 0, 0}`，
+RK3588Dxe 找不到大核的稳压器，A76 簇被设成 2.4 GHz 的时钟却没升电压。改成 `0x6`（NPU 的 SCMI 时钟号）后数组正确。
+**板上（`cb1`，`evb10-exec=1` 跑 `cpu_bench`，对 `ord2`）**：ArmCpu 校准出的 A76 频率 1773–1779 → 2223–2232 MHz（A55 不变，1861 MHz）；`cpu_bench` 里 A76 的 ALU 2.375 → 1.895 ns（−20 %）、
+128 KiB 内指针追逐 4.73 → 3.78 ns、分支混合 11.1 → 8.9 ns；16 MiB 的混合（受访存延迟限制）30.6 → 28.5 ns，只快 7 %。**重放时间几乎没变**（`rep` 中位 3.9–4.2 ms）：编码线程的代码不规则、访存多，
+主要卡在访存延迟上，不是核频率。也没有到固件设的 2.4 GHz（量到 2.23 GHz，原因没查）。空闲系统里新线程 32 次有 31 次落在逻辑核 0（A76），睡醒的主线程 22 次在核 0、10 次在核 1。
+
+
+### 6. 试了没有用、代码已撤的 [板上]
+
+- **`mali-fwpoll=100`**（栅栏等待每 100 µs 看一次，原来每 1 ms）：`ep3` 的提交→完成 p50 14.0 ms，`ep2`（不带）13.7 ms，没有差别。撤了。
+- **`mali-nf=1`**（不做 `FLUSH_CACHE2`，只为量 GPU 时间）：没有跑，撤了。
+- **只给 E 提优先级、或只开慢核回避**：上面的 2×2，都没有用。
+
+### 7. 触摸到第一帧：右滑比左滑慢约 110 ms，和 GPU / 调度都无关 [板上]
+
+演示手势从屏幕左侧 15 %（右滑）或右侧 85 %（左滑）起。**手势开始到第一个命令缓冲提交**：左滑 58–62 ms，右滑 150–180 ms；**到第一个连续动画帧**：左滑 81–93 ms（`ps0` 的中位数 151 ms，被一个手势拉高），右滑 178–207 ms。
+这在所有运行里一样（`gp1 ps0 ep2 ep3 gp2`，`soak1` 的 40 对手势：首个命令缓冲 157 对 57 ms，首个连续动画帧 180 对 85 ms，中位数），GPU 提到 1 GHz 也没变，所以是 SpringBoard / UIKit 一侧的延迟，不是渲染。
+**推测（没有逐线程验证）**：演示的第一个左滑（`g1`）没有产生帧，之后右滑 / 左滑交替——第一页没有后一页，右滑是在第一页向右进 Today View，左滑是退回来。
+`gp1` 的进程表（每 10 s 一张，累计 CPU 时间）：演示开始前空闲 13.7 s 里 `WidgetRenderer_Default` 用户态 CPU 只多 0.003 s，演示期间每 13 s（一次左滑加一次右滑）多 0.17 s，`SpringBoard` 多约 0.7 s；
+所以右滑启动慢的部分很可能是 Today View 的小组件在每次进入时重新渲染（SpringBoard 主线程加 chronod / WidgetRenderer 的 CPU 活），是软件的活，不是 GPU 也不是调度的问题。验证办法：同一个右滑里看这几个进程的线程栈（`evb10-ps` 表的时机和手势对不上，要给内核加一个手势触发的采样）。
+这也是「手指按下 0.8 s 的 fps」读数右滑 48–51、左滑 55–60 的原因：节奏（相邻帧间隔 16.6 ms）两个方向一样。
+
+### 8. 还剩什么
+
+- **右滑启动延迟**（上一节）：推测是 Today View 的小组件在每次进入时重新渲染，还没验证。要在手势开始后的 150 ms 里看 SpringBoard 主线程、chronod 和 WidgetRenderer 的线程栈（`evb10-bt=SpringBoard` 的用户栈；要给内核加手势触发的一次采样，现在的 `evb10-ps` 是定时的）。
+- 剩下的长间隔（`gp2` 手势 3–11 里 4 个）：一个命令缓冲 17–25 ms 的（重放被抢占或提交长），和两三个命令缓冲积压的；手势 2–3 里还有首次使用的 GPU 尖峰（28.8、50 ms，像是壁纸转换第一次跑）。
+- **流式提交**（上一节第 4 条）：GPU 现在的余量大了（p90 15.6 ms，线是 19.3 ms），收益比之前小；仍然是让 GPU 在重放的同时开始跑前面的通道，约省 `rep + sub` 的一半。
+- **触摸 tick 搬到 A55**：`thread_call` 回调不能指定核，要改成自己的内核线程 + `thread_bind`；`evb10-touch-khz=400` 先把它的成本砍掉了 3.6 倍。
+- SpringBoard 主线程偶尔被挤到 A55（上面第 1 节的 4 774 次）：可以让 D / backboardd 的 63 优先级线程别占着快核。
+
+### 9. 复现
+
+`unixnu` 拒绝超过 **1000 字节**的内核命令行（`the kernel command line is 1018 bytes; the limit is 1000`，`payload` 步骤就失败，板子没有动）。上面这些帧率参数现在都在 `board.toml` 的默认里（884 字节），
+再加 `evb10-touch-demo=120 mali-timeline=1` 是 921 字节；多加参数要删别的（`cpumask=31`、`sched-slowcpus=240` 已经用十进制省字节）。`EXTRA_KERNEL_ARGS` 里的参数替换 `board.toml` 里同名的。
+
+```
+cd uefi-evb10
+(CAPTURE_SECS=235 EARLY_STOP=0 EXTRA_KERNEL_ARGS="evb10-touch-demo=120 mali-timeline=1" setsid nohup tools/xnu-probe/run-kernel.sh TAG > runs/TAG.driver.log 2>&1 </dev/null &)
+python3 tools/xnu-probe/frame_phases.py TAG                 # 每个手势一行
+python3 tools/xnu-probe/cb_table.py TAG --latency           # 提交→完成、> 19.3 ms 的比例、A55 上的重放、触摸→第一帧
+python3 tools/xnu-probe/frame_timeline.py TAG --gesture 4 --before 60 --after 400
+```
+
+1 GHz：固件用 `GPU_RAIL_UV=850000` 重编（再 `tools/stub/build.sh`），`EXTRA_KERNEL_ARGS` 里加 `mali-pll=3 mali-div=0 mali-npll=1000`，完整步骤和控制台上该看到的行见 `UniXNU-evb10/docs/reproduce.md`。
+
+表里的 `提交→完成` 和 A55 个数用 `uefi-evb10/tools/xnu-probe/` 里的 `frame_timeline.py` 的 `parse()` 算
+（`mali-timeline=1` 的 `tl` 行：`rep.sub.sch.ca.cb` 里 `ca` 是提交开始时所在的核）；`mali-profile=1` 是 D / E 两个线程的采样器，`prof_report.py` 汇总（编码线程里没有一个热点：panvk 的录制、m2v 的重放、`mach_msg2_trap` 各占一部分，都是平的）。
